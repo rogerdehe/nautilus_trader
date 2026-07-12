@@ -964,14 +964,31 @@ impl ExecutionManager {
                     if let Some(order) = self.get_order(client_order_id) {
                         match order.status() {
                             OrderStatus::Submitted => {
-                                // Generate rejection for submitted orders that never got accepted
-                                if let Some(event) = create_reconciliation_rejected(
-                                    &order,
-                                    Some("INFLIGHT_TIMEOUT"),
+                                // GOLDMINE PATCH (Contract 2 ①, capital-safety): a Submitted
+                                // order the venue query could not resolve is AMBIGUOUS, not
+                                // rejected — "not-found != not-landed". Synthesizing a terminal
+                                // OrderRejected + clearing tracking makes the cached order
+                                // terminal (orders_closed), which SUPPRESSES later fill inference
+                                // for the same deterministic orderLinkId (reconciliation refuses
+                                // to infer fills on closed orders) → real venue fill, local reject,
+                                // silent naked leg. Instead: keep querying by the deterministic
+                                // client_order_id and keep inflight tracking until venue truth
+                                // resolves it. (Query rate is already throttled above.)
+                                let client_id =
+                                    self.cache.borrow().client_id(&client_order_id).copied();
+                                result.queries.push(TradingCommand::QueryOrder(QueryOrder::new(
+                                    order.trader_id(),
+                                    client_id,
+                                    order.strategy_id(),
+                                    order.instrument_id(),
+                                    order.client_order_id(),
+                                    order.venue_order_id(),
+                                    UUID4::new(),
                                     ts_now,
-                                ) {
-                                    result.events.push(event);
-                                }
+                                    None,
+                                    None, // correlation_id
+                                )));
+                                continue; // keep tracking; skip clear_recon_tracking below
                             }
                             OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
                                 // Generate cancellation for orders stuck in pending modify/cancel
