@@ -69,7 +69,8 @@ use super::{
         BybitSubApiKeysResponse, BybitSubMember, BybitSubMembersPagedResponse,
         BybitSubMembersResponse, BybitSwitchModeResponse, BybitTickerData, BybitTickerOption,
         BybitTickersOptionResponse, BybitTradeHistoryResponse, BybitTradesResponse,
-        BybitUpdateMasterApiResponse, BybitUpdateSubApiResponse, BybitWalletBalanceResponse,
+        BybitTransactionLogResponse, BybitUpdateMasterApiResponse, BybitUpdateSubApiResponse,
+        BybitWalletBalanceResponse,
     },
     query::{
         BybitAmendOrderParamsBuilder, BybitBatchAmendOrderEntryBuilder,
@@ -84,7 +85,8 @@ use super::{
         BybitSetMarginModeParamsBuilder, BybitSetTradingStopParams, BybitSubApiKeysParams,
         BybitSubMembersPageParams, BybitSwitchModeParamsBuilder, BybitTickersParams,
         BybitTradeHistoryParams, BybitTradesParams, BybitTradesParamsBuilder,
-        BybitUpdateMasterApiParams, BybitUpdateSubApiParams, BybitWalletBalanceParams,
+        BybitTransactionLogParams, BybitUpdateMasterApiParams, BybitUpdateSubApiParams,
+        BybitWalletBalanceParams,
     },
 };
 use crate::common::{
@@ -872,6 +874,33 @@ impl BybitRawHttpClient {
         self.send_request(
             Method::GET,
             "/v5/account/wallet-balance",
+            Some(params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches the account transaction log (requires authentication).
+    ///
+    /// Cursor-paginated cash-movement ledger (funding settlements, trading fees, transfers). The
+    /// caller drives pagination via [`BybitTransactionLogParams::cursor`] using the response's
+    /// `next_page_cursor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/account/transaction-log>
+    pub async fn get_transaction_log(
+        &self,
+        params: &BybitTransactionLogParams,
+    ) -> Result<BybitTransactionLogResponse, BybitHttpError> {
+        self.send_request(
+            Method::GET,
+            "/v5/account/transaction-log",
             Some(params),
             None,
             true,

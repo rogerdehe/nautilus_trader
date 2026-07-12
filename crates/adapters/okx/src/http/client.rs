@@ -84,6 +84,7 @@ use super::{
     error::OKXHttpError,
     models::{
         OKXAccount, OKXAmendAlgoOrderRequest, OKXAmendAlgoOrderResponse, OKXAttachAlgoOrdRequest,
+        OKXBill,
         OKXCancelAlgoOrderRequest, OKXCancelAlgoOrderResponse, OKXCancelAllSpreadOrdersRequest,
         OKXCancelOrderRequest, OKXCancelOrderResponse, OKXCancelSpreadOrderRequest,
         OKXEventContractEvent, OKXEventContractMarket, OKXEventContractSeries, OKXFeeRate,
@@ -94,7 +95,7 @@ use super::{
         OKXSpreadOrder, OKXSpreadTrade, OKXTransactionDetail,
     },
     query::{
-        GetAlgoOrdersParams, GetAlgoOrdersParamsBuilder, GetCandlesticksParams,
+        GetAlgoOrdersParams, GetAlgoOrdersParamsBuilder, GetBillsParams, GetCandlesticksParams,
         GetCandlesticksParamsBuilder, GetEventContractEventsParams, GetEventContractMarketsParams,
         GetEventContractSeriesParams, GetFundingRateHistoryParams, GetIndexTickerParams,
         GetIndexTickerParamsBuilder, GetInstrumentsParams, GetInstrumentsParamsBuilder,
@@ -1571,6 +1572,29 @@ impl OKXRawHttpClient {
         self.send_request(
             Method::GET,
             "/api/v5/trade/fills",
+            Some(&params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Requests account bills (cash movements) for the last 7 days.
+    ///
+    /// Filter by [`GetBillsParams::bill_type`] to isolate a category; funding settlements use
+    /// `bill_type = "8"`. Authenticated endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-bills-details-last-7-days>
+    pub async fn get_bills(&self, params: GetBillsParams) -> Result<Vec<OKXBill>, OKXHttpError> {
+        self.send_request(
+            Method::GET,
+            "/api/v5/account/bills",
             Some(&params),
             None,
             true,

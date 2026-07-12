@@ -1265,6 +1265,80 @@ pub struct BybitExecution {
 /// - <https://bybit-exchange.github.io/docs/v5/order/execution>
 pub type BybitTradeHistoryResponse = BybitCursorListResponse<BybitExecution>;
 
+/// One `GET /v5/account/transaction-log` row (an account cash movement).
+///
+/// Money-bearing fields (`funding`, `fee`, `cash_flow`, `change`, `cash_balance`) are modeled as
+/// `Option<String>` because the venue may return them empty (`""`) or omit them entirely; callers
+/// must parse them as `Decimal` with empty/missing treated as zero, and must never silently coerce
+/// a non-empty unparseable value to zero. `id` is the row's dedup key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitTransactionLogEntry {
+    /// Exchange row id (dedup key).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Symbol the movement belongs to (e.g. `BTCUSDT`); empty for non-symbol movements.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Product category (e.g. `linear`, `spot`).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Trade side, when applicable.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Settlement/quote currency (e.g. `USDT`).
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// Movement type (e.g. `SETTLEMENT`, `TRADE`, `TRANSFER_IN`).
+    #[serde(rename = "type", default)]
+    pub transaction_type: Option<String>,
+    /// Net change to the balance for this row.
+    #[serde(default)]
+    pub change: Option<String>,
+    /// Cash flow component of the change.
+    #[serde(default)]
+    pub cash_flow: Option<String>,
+    /// Wallet balance after the row was applied.
+    #[serde(default)]
+    pub cash_balance: Option<String>,
+    /// Funding amount (positive = received) for funding settlements.
+    #[serde(default)]
+    pub funding: Option<String>,
+    /// Fee charged for this row (positive = cost).
+    #[serde(default)]
+    pub fee: Option<String>,
+    /// Fee rate applied.
+    #[serde(default)]
+    pub fee_rate: Option<String>,
+    /// Trade price, when applicable.
+    #[serde(default)]
+    pub trade_price: Option<String>,
+    /// Quantity, when applicable.
+    #[serde(default)]
+    pub qty: Option<String>,
+    /// Size, when applicable.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Related trade id.
+    #[serde(default)]
+    pub trade_id: Option<String>,
+    /// Related order id.
+    #[serde(default)]
+    pub order_id: Option<String>,
+    /// Client order id.
+    #[serde(default)]
+    pub order_link_id: Option<String>,
+    /// Row timestamp (ms since epoch, as a string).
+    #[serde(default)]
+    pub transaction_time: Option<String>,
+}
+
+/// Response alias for transaction-log requests (cursor-paginated).
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/account/transaction-log>
+pub type BybitTransactionLogResponse = BybitCursorListResponse<BybitTransactionLogEntry>;
+
 /// Represents a position returned by the Bybit API.
 ///
 /// # References
@@ -2374,5 +2448,80 @@ mod tests {
         assert_eq!(response.result.permissions.bit_card, vec!["BitCard"]);
         assert_eq!(response.result.permissions.byx_post, vec!["ByXPost"]);
         assert_eq!(response.result.unified, Some(0));
+    }
+
+    #[rstest]
+    fn deserialize_transaction_log_response() {
+        // Realistic Bybit v5 transaction-log payload: a funding SETTLEMENT row plus a TRADE fee
+        // row, with the final-page cursor sentinel (`""`). Money-bearing fields stay as strings.
+        let json = r#"{
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [
+                    {
+                        "id": "592324_XRPUSDT_161440249321",
+                        "symbol": "XRPUSDT",
+                        "category": "linear",
+                        "side": "Buy",
+                        "transactionTime": "1672132480085",
+                        "type": "SETTLEMENT",
+                        "qty": "100",
+                        "size": "100",
+                        "currency": "USDT",
+                        "tradePrice": "0.3676",
+                        "funding": "-0.003676",
+                        "fee": "",
+                        "cashFlow": "0",
+                        "change": "-0.003676",
+                        "cashBalance": "0",
+                        "feeRate": "0.0001",
+                        "tradeId": "",
+                        "orderId": "",
+                        "orderLinkId": ""
+                    },
+                    {
+                        "id": "592324_XRPUSDT_161440249322",
+                        "symbol": "XRPUSDT",
+                        "category": "linear",
+                        "side": "Sell",
+                        "transactionTime": "1672132480086",
+                        "type": "TRADE",
+                        "currency": "USDT",
+                        "funding": "",
+                        "fee": "0.01",
+                        "cashFlow": "-0.01",
+                        "change": "-0.01",
+                        "cashBalance": "0"
+                    }
+                ],
+                "nextPageCursor": ""
+            },
+            "retExtInfo": {},
+            "time": 1672132480200
+        }"#;
+
+        let response: BybitTransactionLogResponse =
+            serde_json::from_str(json).expect("parse transaction log");
+        assert_eq!(response.ret_code, 0);
+        assert_eq!(response.result.list.len(), 2);
+        assert_eq!(response.result.next_page_cursor.as_deref(), Some(""));
+
+        let settlement = &response.result.list[0];
+        assert_eq!(settlement.id.as_deref(), Some("592324_XRPUSDT_161440249321"));
+        assert_eq!(settlement.symbol.as_deref(), Some("XRPUSDT"));
+        assert_eq!(settlement.transaction_type.as_deref(), Some("SETTLEMENT"));
+        assert_eq!(settlement.currency.as_deref(), Some("USDT"));
+        assert_eq!(settlement.funding.as_deref(), Some("-0.003676"));
+        assert_eq!(settlement.fee.as_deref(), Some(""));
+        assert_eq!(settlement.transaction_time.as_deref(), Some("1672132480085"));
+
+        let trade = &response.result.list[1];
+        assert_eq!(trade.transaction_type.as_deref(), Some("TRADE"));
+        assert_eq!(trade.funding.as_deref(), Some(""));
+        assert_eq!(trade.fee.as_deref(), Some("0.01"));
+        // Fields absent from the payload deserialize to None (not an error).
+        assert_eq!(trade.qty, None);
+        assert_eq!(trade.order_id, None);
     }
 }

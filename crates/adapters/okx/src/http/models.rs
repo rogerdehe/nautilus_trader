@@ -1198,6 +1198,45 @@ pub struct OKXTransactionDetail {
     pub ts: u64,
 }
 
+/// Represents an account bill (cash movement) from `GET /api/v5/account/bills`.
+///
+/// Money-bearing fields (`pnl`, `bal_chg`, `fee`) are modeled as `Option<String>` because OKX
+/// returns them empty (`""`) when not applicable; callers must parse them as `Decimal` with an
+/// empty value treated as zero and never silently coerce a non-empty unparseable value. For a
+/// funding bill (`bill_type == "8"`), the settled cash amount is carried by `bal_chg`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXBill {
+    /// Bill id (dedup key).
+    pub bill_id: Ustr,
+    /// Instrument type (SPOT, SWAP, ...); empty for non-instrument movements.
+    #[serde(default)]
+    pub inst_type: String,
+    /// Instrument id, e.g. "BTC-USDT-SWAP"; empty for non-instrument movements.
+    #[serde(default)]
+    pub inst_id: String,
+    /// Bill type numeric code (e.g. "8" for funding fee).
+    #[serde(rename = "type", default)]
+    pub bill_type: String,
+    /// Bill sub-type numeric code.
+    #[serde(default)]
+    pub sub_type: String,
+    /// Currency of the movement, e.g. "USDT".
+    pub ccy: Ustr,
+    /// Profit and loss component (empty when not applicable).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub pnl: Option<String>,
+    /// Balance change for this bill (the settled cash amount).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub bal_chg: Option<String>,
+    /// Fee component (empty when not applicable).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub fee: Option<String>,
+    /// Bill creation timestamp (ms since epoch).
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub ts: u64,
+}
+
 /// Represents a single historical position record from `GET /api/v5/account/positions-history`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1521,6 +1560,55 @@ mod tests {
     use serde_json;
 
     use super::*;
+
+    #[rstest]
+    fn test_parse_account_bills_funding() {
+        // Realistic `GET /api/v5/account/bills` data array: a funding bill (type "8") whose settled
+        // cash is in `balChg`, plus a fee bill. Empty money fields collapse to None.
+        let json = r#"[
+            {
+                "billId": "1111111111111111111",
+                "instType": "SWAP",
+                "instId": "BTC-USDT-SWAP",
+                "type": "8",
+                "subType": "173",
+                "ccy": "USDT",
+                "pnl": "",
+                "balChg": "-0.375",
+                "fee": "0",
+                "ts": "1672286400000"
+            },
+            {
+                "billId": "1111111111111111112",
+                "instType": "SWAP",
+                "instId": "BTC-USDT-SWAP",
+                "type": "2",
+                "subType": "1",
+                "ccy": "USDT",
+                "pnl": "1.5",
+                "balChg": "1.49",
+                "fee": "-0.01",
+                "ts": "1672286500000"
+            }
+        ]"#;
+
+        let bills: Vec<OKXBill> = serde_json::from_str(json).expect("parse account bills");
+        assert_eq!(bills.len(), 2);
+
+        let funding = &bills[0];
+        assert_eq!(funding.bill_id.as_str(), "1111111111111111111");
+        assert_eq!(funding.bill_type, "8");
+        assert_eq!(funding.inst_id, "BTC-USDT-SWAP");
+        assert_eq!(funding.ccy.as_str(), "USDT");
+        assert_eq!(funding.pnl, None); // empty string -> None
+        assert_eq!(funding.bal_chg.as_deref(), Some("-0.375"));
+        assert_eq!(funding.ts, 1672286400000);
+
+        let fee = &bills[1];
+        assert_eq!(fee.bill_type, "2");
+        assert_eq!(fee.pnl.as_deref(), Some("1.5"));
+        assert_eq!(fee.fee.as_deref(), Some("-0.01"));
+    }
 
     #[rstest]
     fn test_algo_order_request_serialization() {

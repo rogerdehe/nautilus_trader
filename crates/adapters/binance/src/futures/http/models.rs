@@ -2730,4 +2730,47 @@ mod tests {
         let result = status.to_nautilus_order_status(treat_expired_as_canceled);
         assert_eq!(result, expected);
     }
+
+    #[rstest]
+    fn test_parse_income_history_funding_fee() {
+        // Realistic `GET /fapi/v1/income` payload (incomeType=FUNDING_FEE). `income` is a signed
+        // string amount in `asset`; a transfer row carries an empty symbol.
+        let json = r#"[
+            {
+                "symbol": "BTCUSDT",
+                "incomeType": "FUNDING_FEE",
+                "income": "-0.37500000",
+                "asset": "USDT",
+                "info": "FUNDING_FEE",
+                "time": 1672286400000,
+                "tranId": 9689322392
+            },
+            {
+                "symbol": "",
+                "incomeType": "TRANSFER",
+                "income": "100.00000000",
+                "asset": "USDT",
+                "info": "TRANSFER",
+                "time": 1672200000000,
+                "tranId": 9689322000
+            }
+        ]"#;
+
+        let records: Vec<BinanceIncomeRecord> =
+            serde_json::from_str(json).expect("parse income history");
+        assert_eq!(records.len(), 2);
+
+        let funding = &records[0];
+        assert_eq!(funding.symbol.as_deref(), Some("BTCUSDT"));
+        assert_eq!(funding.income_type, BinanceIncomeType::FundingFee);
+        assert_eq!(funding.income, "-0.37500000");
+        assert_eq!(funding.asset.as_str(), "USDT");
+        assert_eq!(funding.time, 1672286400000);
+        assert_eq!(funding.tran_id, Some(9689322392));
+
+        let transfer = &records[1];
+        assert_eq!(transfer.symbol.as_deref(), Some(""));
+        assert_eq!(transfer.income_type, BinanceIncomeType::Transfer);
+        assert_eq!(transfer.trade_id, None);
+    }
 }

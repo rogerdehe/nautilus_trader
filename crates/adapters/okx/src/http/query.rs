@@ -628,6 +628,47 @@ pub struct GetTransactionDetailsParams {
     pub limit: Option<u32>,
 }
 
+/// Parameters for the GET /api/v5/account/bills endpoint (last 7 days of account bills).
+///
+/// Filter by `bill_type` to isolate a category of movement. Funding settlements use
+/// `bill_type = "8"` (OKX numeric code for "Funding fee").
+///
+/// # References
+/// - <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-bills-details-last-7-days>
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetBillsParams {
+    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_type: Option<OKXInstrumentType>,
+    /// Currency filter, e.g. "USDT" (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ccy: Option<String>,
+    /// Bill type numeric code, e.g. "8" for funding fee (optional).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub bill_type: Option<String>,
+    /// Bill sub-type numeric code (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_type: Option<String>,
+    /// Pagination: return records earlier than the requested bill id (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Pagination: return records newer than the requested bill id (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Filter with a begin timestamp (ms since epoch, as a string) (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// Filter with an end timestamp (ms since epoch, as a string) (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Number of results per request (default 100, max 100) (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// Parameters for the GET /api/v5/public/positions endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]

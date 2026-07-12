@@ -237,6 +237,43 @@ pub struct BybitWalletBalanceParams {
     pub coin: Option<String>,
 }
 
+/// Query parameters for `GET /v5/account/transaction-log`.
+///
+/// Cash-movement ledger (funding settlements, trading fees, transfers). Paginated via `cursor`.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/account/transaction-log>
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitTransactionLogParams {
+    /// Account type (currently only `UNIFIED`).
+    pub account_type: BybitAccountType,
+    /// Product category filter (e.g. `linear`, `spot`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub category: Option<BybitProductType>,
+    /// Settlement/quote currency filter (e.g. `USDT`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option), default)]
+    pub currency: Option<String>,
+    /// Inclusive window start (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub start_time: Option<i64>,
+    /// Inclusive window end (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub end_time: Option<i64>,
+    /// Page size (max 50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub limit: Option<u32>,
+    /// Pagination cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option), default)]
+    pub cursor: Option<String>,
+}
+
 /// Query parameters for `GET /v5/position/list`.
 ///
 /// # References

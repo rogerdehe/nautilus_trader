@@ -52,7 +52,7 @@ use super::{
         BinanceFuturesCoinExchangeInfo, BinanceFuturesCoinSymbol, BinanceFuturesKline,
         BinanceFuturesMarkPrice, BinanceFuturesOrder, BinanceFuturesTicker24hr,
         BinanceFuturesTrade, BinanceFuturesUsdExchangeInfo, BinanceFuturesUsdSymbol,
-        BinanceHedgeModeResponse, BinanceLeverageResponse, BinanceOpenInterest,
+        BinanceHedgeModeResponse, BinanceIncomeRecord, BinanceLeverageResponse, BinanceOpenInterest,
         BinanceOpenInterestHistRecord, BinanceOrderBook, BinancePositionRisk, BinancePriceTicker,
         BinanceServerTime, BinanceUserTrade, ListenKeyResponse,
     },
@@ -60,7 +60,8 @@ use super::{
         BatchCancelItem, BatchModifyItem, BatchOrderItem, BinanceAlgoOrderQueryParams,
         BinanceAllAlgoOrdersParams, BinanceAllOrdersParams, BinanceBookTickerParams,
         BinanceCancelAllAlgoOrdersParams, BinanceCancelAllOrdersParams, BinanceCancelOrderParams,
-        BinanceDepthParams, BinanceFundingRateParams, BinanceKlinesParams, BinanceMarkPriceParams,
+        BinanceDepthParams, BinanceFundingRateParams, BinanceIncomeHistoryParams,
+        BinanceKlinesParams, BinanceMarkPriceParams,
         BinanceModifyOrderParams, BinanceNewAlgoOrderParams, BinanceNewOrderParams,
         BinanceOpenAlgoOrdersParams, BinanceOpenInterestHistParams, BinanceOpenInterestParams,
         BinanceOpenOrdersParams, BinanceOrderQueryParams, BinancePositionRiskParams,
@@ -842,6 +843,31 @@ impl BinanceRawFuturesHttpClient {
         params: &BinanceUserTradesParams,
     ) -> BinanceFuturesHttpResult<Vec<BinanceUserTrade>> {
         self.get("userTrades", Some(params), true, false).await
+    }
+
+    /// Fetches account income history (funding fees, commissions, realized PnL, transfers).
+    ///
+    /// Filter by [`BinanceIncomeHistoryParams::income_type`] (e.g. `FUNDING_FEE`) to isolate
+    /// funding settlements. Signed request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    ///
+    /// # References
+    ///
+    /// - <https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History>
+    pub async fn get_income(
+        &self,
+        params: &BinanceIncomeHistoryParams,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceIncomeRecord>> {
+        // USD-M uses /fapi/v1/income, COIN-M uses /dapi/v1/income.
+        let path = if self.api_path.starts_with("/fapi") {
+            "/fapi/v1/income"
+        } else {
+            "/dapi/v1/income"
+        };
+        self.get(path, Some(params), true, false).await
     }
 
     /// Queries a single order by order ID or client order ID.
