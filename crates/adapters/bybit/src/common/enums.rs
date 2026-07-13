@@ -940,6 +940,21 @@ impl BybitExecType {
             Self::AdlTrade | Self::BustTrade | Self::Delivery | Self::Settle
         )
     }
+
+    /// Returns `true` if this execution is a funding-fee settlement rather than a
+    /// position-changing trade.
+    ///
+    /// Bybit's `execution` stream emits a `Funding` record at each funding
+    /// settlement (00:00/08:00/16:00 UTC), carrying the position's `execQty` and
+    /// `side`. These settle the funding fee against the wallet balance and do NOT
+    /// change the position. They must never be turned into a fill — doing so
+    /// manufactures a phantom position change (a paired open+undo) on every
+    /// funding tick, corrupting the position cache and emitting bogus fill events
+    /// and notifications for what is not a trade.
+    #[must_use]
+    pub const fn is_funding(&self) -> bool {
+        matches!(self, Self::Funding)
+    }
 }
 
 /// Transaction types for wallet funding records.
@@ -1164,5 +1179,18 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(exec_type.is_exchange_generated(), expected);
+    }
+
+    #[rstest]
+    #[case(BybitExecType::Funding, true)]
+    #[case(BybitExecType::Trade, false)]
+    #[case(BybitExecType::AdlTrade, false)]
+    #[case(BybitExecType::BustTrade, false)]
+    #[case(BybitExecType::Delivery, false)]
+    #[case(BybitExecType::Settle, false)]
+    #[case(BybitExecType::BlockTrade, false)]
+    #[case(BybitExecType::MovePosition, false)]
+    fn test_exec_type_is_funding(#[case] exec_type: BybitExecType, #[case] expected: bool) {
+        assert_eq!(exec_type.is_funding(), expected);
     }
 }

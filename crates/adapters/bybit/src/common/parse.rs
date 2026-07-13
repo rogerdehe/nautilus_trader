@@ -1427,7 +1427,15 @@ pub fn parse_order_status_report(
         report = report.with_client_order_id(ClientOrderId::new(order.order_link_id.as_str()));
     }
 
-    if !order.price.is_empty() && order.price != "0" {
+    // GOLDMINE null-at-source (market-order price): a MARKET order has no limit price. Bybit still
+    // populates `price` on a market order's status message (e.g. the last/executed price); carrying it
+    // into the report → OrderUpdated would hit `MarketOrder::update`'s `assert!(price.is_none())` and
+    // panic the live node. A market order's fill price flows via OrderFilled, never OrderUpdated, so
+    // NEVER set a price for a market order here. (Mirrors the WS `parse_order_snapshot` guard.)
+    if !matches!(order.order_type, BybitOrderType::Market)
+        && !order.price.is_empty()
+        && order.price != "0"
+    {
         let price =
             parse_price_with_precision(&order.price, instrument.price_precision(), "order.price")?;
         report = report.with_price(price);
@@ -1443,7 +1451,15 @@ pub fn parse_order_status_report(
         report = report.with_avg_px(avg_px)?;
     }
 
-    if !order.trigger_price.is_empty() && order.trigger_price != "0" {
+    // GOLDMINE null-at-source (non-conditional trigger): a NON-conditional order (plain Market/Limit,
+    // `stop_order_type == None`) has no trigger price. Bybit can still populate a stray `triggerPrice`;
+    // carrying it into the report → OrderUpdated would panic a Nautilus Limit/MarketToLimit/Market
+    // `update()` (which assert `trigger_price.is_none()`). Only set a trigger for definitively-
+    // conditional orders. (Mirrors the WS `parse_order_snapshot` guard exactly.)
+    if !matches!(order.stop_order_type, BybitStopOrderType::None)
+        && !order.trigger_price.is_empty()
+        && order.trigger_price != "0"
+    {
         let trigger_price = parse_price_with_precision(
             &order.trigger_price,
             instrument.price_precision(),
@@ -1850,7 +1866,10 @@ mod tests {
     use super::*;
     use crate::{
         common::{
-            enums::{BybitOrderSide, BybitOrderType, BybitStopOrderType, BybitTriggerDirection},
+            enums::{
+                BybitExecType, BybitOrderSide, BybitOrderType, BybitStopOrderType,
+                BybitTriggerDirection,
+            },
             testing::load_test_json,
         },
         http::models::{
@@ -2794,6 +2813,36 @@ mod tests {
         assert_eq!(report.venue_position_id, None);
     }
 
+    /// GOLDMINE regression (REST fill-report path, funding filter): `GET /v5/execution/list` also
+    /// returns funding settlements (`execType=Funding`) carrying the position's side + qty. These are
+    /// cash settlements, NOT trades, and must be skipped in `request_fill_reports` (mirroring the WS
+    /// `dispatch_execution_fill` guard) — otherwise they re-inject a phantom position change and corrupt
+    /// reconciliation. This proves the exact loop guard (`is_funding()`) filters a Funding execution
+    /// while keeping a real Trade execution.
+    #[rstest]
+    fn test_request_fill_reports_skips_funding_execution() {
+        let json = load_test_json("http_get_executions.json");
+        let response: BybitTradeHistoryResponse = serde_json::from_str(&json).unwrap();
+
+        // A real trade execution (kept) and a funding settlement clone (must be skipped).
+        let trade = response.result.list[0].clone();
+        assert_eq!(trade.exec_type, BybitExecType::Trade);
+        assert!(!trade.exec_type.is_funding());
+
+        let mut funding = trade.clone();
+        funding.exec_type = BybitExecType::Funding;
+        assert!(funding.exec_type.is_funding());
+
+        // Apply the identical guard the `request_fill_reports` loop uses (`if is_funding() { continue }`).
+        let kept: Vec<_> = [trade, funding]
+            .into_iter()
+            .filter(|execution| !execution.exec_type.is_funding())
+            .collect();
+
+        assert_eq!(kept.len(), 1, "funding execution must be filtered out");
+        assert_eq!(kept[0].exec_type, BybitExecType::Trade);
+    }
+
     #[rstest]
     fn test_parse_order_status_report_venue_position_id_for_hedge() {
         let instrument = linear_instrument();
@@ -2839,5 +2888,68 @@ mod tests {
         let report = parse_order_status_report(order, &instrument, account_id, TS).unwrap();
 
         assert_eq!(report.venue_position_id, None);
+    }
+
+    /// GOLDMINE regression (REST order-report path, market-order price null-at-source): a MARKET order
+    /// has no limit price, but Bybit populates `price` on its status message. The report must NOT carry
+    /// it — a downstream `MarketOrder::update` asserts `price.is_none()` and would panic the live node.
+    /// Mirrors the WS `parse_order_snapshot` guard.
+    #[rstest]
+    fn test_parse_order_status_report_nulls_price_for_market() {
+        let instrument = linear_instrument();
+        let json = load_test_json("http_get_orders_realtime_tp_sl.json");
+        let response: BybitOpenOrdersResponse = serde_json::from_str(&json).unwrap();
+        let account_id = AccountId::new("BYBIT-001");
+
+        // A plain MARKET order that (as Bybit does) still carries a non-zero `price`.
+        let mut order = response.result.list[0].clone();
+        order.order_type = BybitOrderType::Market;
+        order.stop_order_type = BybitStopOrderType::None;
+        order.price = "50000.00".to_string();
+
+        let report = parse_order_status_report(&order, &instrument, account_id, TS).unwrap();
+        assert_eq!(
+            report.price, None,
+            "a MARKET order's report must never carry a price (would panic MarketOrder::update)"
+        );
+
+        // Control: a LIMIT order keeps its legitimate price.
+        let mut limit = response.result.list[1].clone();
+        limit.order_type = BybitOrderType::Limit;
+        limit.stop_order_type = BybitStopOrderType::None;
+        limit.price = "47500.00".to_string();
+        let limit_report = parse_order_status_report(&limit, &instrument, account_id, TS).unwrap();
+        assert_eq!(limit_report.price, Some(Price::from("47500.00")));
+    }
+
+    /// GOLDMINE regression (REST order-report path, non-conditional trigger null-at-source): a
+    /// NON-conditional order (`stop_order_type == None`) has no trigger price, but Bybit can populate a
+    /// stray `triggerPrice`. The report must NOT carry it — a downstream Limit/MarketToLimit `update()`
+    /// asserts `trigger_price.is_none()` and would panic. A CONDITIONAL order keeps its trigger.
+    /// Mirrors the WS `parse_order_snapshot` guard.
+    #[rstest]
+    fn test_parse_order_status_report_nulls_trigger_for_non_conditional() {
+        let instrument = linear_instrument();
+        let json = load_test_json("http_get_orders_realtime_tp_sl.json");
+        let response: BybitOpenOrdersResponse = serde_json::from_str(&json).unwrap();
+        let account_id = AccountId::new("BYBIT-001");
+
+        // Non-conditional LIMIT with a stray triggerPrice → trigger nulled at source.
+        let mut order = response.result.list[1].clone();
+        order.order_type = BybitOrderType::Limit;
+        order.stop_order_type = BybitStopOrderType::None;
+        order.trigger_price = "49000.00".to_string();
+        let report = parse_order_status_report(&order, &instrument, account_id, TS).unwrap();
+        assert_eq!(
+            report.trigger_price, None,
+            "a non-conditional order's report must not carry a trigger_price (would panic Limit::update)"
+        );
+
+        // Control: a CONDITIONAL order (StopLoss) keeps its legitimate trigger (fixture: triggerPrice 48000).
+        let conditional = &response.result.list[1];
+        assert_eq!(conditional.stop_order_type, BybitStopOrderType::StopLoss);
+        let cond_report =
+            parse_order_status_report(conditional, &instrument, account_id, TS).unwrap();
+        assert_eq!(cond_report.trigger_price, Some(Price::from("48000.00")));
     }
 }

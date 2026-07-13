@@ -48,7 +48,9 @@ use super::{
     },
 };
 use crate::common::{
-    enums::{BybitOrderStatus, BybitPositionSide, BybitTimeInForce},
+    enums::{
+        BybitOrderStatus, BybitOrderType, BybitPositionSide, BybitStopOrderType, BybitTimeInForce,
+    },
     parse::{
         get_currency, make_hedge_venue_position_id, parse_book_level, parse_bybit_order_type,
         parse_millis_timestamp, parse_price_with_precision, parse_quantity_with_precision,
@@ -811,7 +813,15 @@ pub fn parse_ws_order_status_report(
         report = report.with_client_order_id(ClientOrderId::new(order.order_link_id.as_str()));
     }
 
-    if !order.price.is_empty() && order.price != "0" {
+    // GOLDMINE null-at-source (market-order price): a MARKET order has no limit price. Bybit still
+    // populates `price` on a market order's status message; carrying it into the report → OrderUpdated
+    // would hit `MarketOrder::update`'s `assert!(price.is_none())` and panic the live node. NEVER set a
+    // price for a market order here. (Mirrors the WS `parse_order_snapshot` / REST
+    // `parse_order_status_report` guards.)
+    if !matches!(order.order_type, BybitOrderType::Market)
+        && !order.price.is_empty()
+        && order.price != "0"
+    {
         let price =
             parse_price_with_precision(&order.price, instrument.price_precision(), "order.price")?;
         report = report.with_price(price);
@@ -825,7 +835,15 @@ pub fn parse_ws_order_status_report(
         report = report.with_avg_px(avg_px)?;
     }
 
-    if !order.trigger_price.is_empty() && order.trigger_price != "0" {
+    // GOLDMINE null-at-source (non-conditional trigger): a NON-conditional order (plain Market/Limit,
+    // `stop_order_type == None`) has no trigger price. Bybit can still populate a stray `triggerPrice`;
+    // carrying it into the report → OrderUpdated would panic a Nautilus Limit/MarketToLimit/Market
+    // `update()` (which assert `trigger_price.is_none()`). Only set a trigger for definitively-
+    // conditional orders. (Mirrors the WS `parse_order_snapshot` / REST guards exactly.)
+    if !matches!(order.stop_order_type, BybitStopOrderType::None)
+        && !order.trigger_price.is_empty()
+        && order.trigger_price != "0"
+    {
         let trigger_price = parse_price_with_precision(
             &order.trigger_price,
             instrument.price_precision(),
@@ -1592,6 +1610,55 @@ mod tests {
             report.venue_position_id,
             Some(PositionId::from("BTCUSDT-LINEAR.BYBIT-LONG"))
         );
+    }
+
+    /// GOLDMINE regression (WS order-status-report path, null-at-source): `parse_ws_order_status_report`
+    /// must strip a stray `price` on a MARKET order and a stray `triggerPrice` on a non-conditional
+    /// order, exactly like the WS snapshot and REST status-report paths. Otherwise the report →
+    /// OrderUpdated hits `MarketOrder::update`'s `assert!(price.is_none())` (or a Limit's
+    /// `assert!(trigger_price.is_none())`) and panics the live node.
+    #[rstest]
+    fn parse_ws_order_status_report_nulls_price_and_trigger_at_source() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order.json");
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        let account_id = AccountId::new("BYBIT-001");
+
+        // MARKET order that (as Bybit does) still carries a non-zero `price` → nulled.
+        let mut market = msg.data[0].clone();
+        market.order_type = BybitOrderType::Market;
+        market.stop_order_type = BybitStopOrderType::None;
+        market.price = "50000.00".to_string();
+        market.trigger_price = String::new();
+        let report = parse_ws_order_status_report(&market, &instrument, account_id, TS).unwrap();
+        assert_eq!(
+            report.price, None,
+            "a MARKET order's report must never carry a price (would panic MarketOrder::update)"
+        );
+
+        // Non-conditional LIMIT with a stray triggerPrice → trigger nulled; legitimate price kept.
+        let mut limit = msg.data[0].clone();
+        limit.order_type = BybitOrderType::Limit;
+        limit.stop_order_type = BybitStopOrderType::None;
+        limit.price = "47500.00".to_string();
+        limit.trigger_price = "49000.00".to_string();
+        let limit_report = parse_ws_order_status_report(&limit, &instrument, account_id, TS).unwrap();
+        assert_eq!(
+            limit_report.trigger_price, None,
+            "a non-conditional order's report must not carry a trigger_price (would panic Limit::update)"
+        );
+        assert_eq!(limit_report.price, Some(Price::from("47500.00")));
+
+        // Control: a CONDITIONAL order keeps its legitimate trigger.
+        let mut conditional = msg.data[0].clone();
+        conditional.order_type = BybitOrderType::Market;
+        conditional.stop_order_type = BybitStopOrderType::StopLoss;
+        conditional.price = String::new();
+        conditional.trigger_price = "45000.00".to_string();
+        let cond_report =
+            parse_ws_order_status_report(&conditional, &instrument, account_id, TS).unwrap();
+        assert_eq!(cond_report.trigger_price, Some(Price::from("45000.00")));
     }
 
     #[rstest]

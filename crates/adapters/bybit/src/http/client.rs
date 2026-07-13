@@ -4558,6 +4558,16 @@ impl BybitHttpClient {
         let mut reports = Vec::new();
 
         for execution in all_executions {
+            // Funding settlements also arrive on /v5/execution/list (execType=Funding), carrying the
+            // position's side + qty but representing a cash settlement, not a trade. Turning them into
+            // FillReports re-injects the same phantom the WS path already filters
+            // (dispatch_execution_fill) and corrupts reconciliation with a non-existent position
+            // change. Skip them here too — funding is accounted via the wallet balance and the funding
+            // ledger, never as a fill. Matches BybitExecType::is_funding usage on the WS main path.
+            if execution.exec_type.is_funding() {
+                continue;
+            }
+
             // Get instrument for this execution
             // Bybit returns raw symbol (e.g. "ETHUSDT"), need to add product suffix for cache lookup
             let symbol_with_product =

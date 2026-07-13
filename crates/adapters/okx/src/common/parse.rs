@@ -844,7 +844,20 @@ pub fn parse_order_status_report(
     );
 
     // Optional fields
-    if !order.px.is_empty()
+    // GOLDMINE null-at-source (market-like price, defense-in-depth): only LIMIT-price-carrying order
+    // types have a limit `px`. Market-like types (Market, and StopMarket via `OKXOrderType::Trigger`,
+    // MarketIfTouched, TrailingStopMarket) have NO limit price — their model `update()` asserts
+    // `price.is_none()`, so attaching a stray `px` on a reconciliation OrderUpdated would panic the
+    // node. Whitelist the limit-carrying types only (mirrors the Binance `order_type_has_limit_price`
+    // predicate and the Bybit adapter guard).
+    if matches!(
+        order_type,
+        OrderType::Limit
+            | OrderType::StopLimit
+            | OrderType::LimitIfTouched
+            | OrderType::MarketToLimit
+            | OrderType::TrailingStopLimit
+    ) && !order.px.is_empty()
         && let Ok(decimal) = Decimal::from_str(&order.px)
         && let Ok(price) = Price::from_decimal_dp(decimal, price_precision)
     {

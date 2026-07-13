@@ -115,12 +115,18 @@ pub fn parse_futures_order_update_to_order_status(
         None, // report_id
     );
 
-    report.price = Some(price);
+    // GOLDMINE null-at-source: only carry a price for limit-carrying order types. A market-like order
+    // (Binance sends `original_price="0"`) must not carry `Some(0.00)`, else a qty-only reconciliation
+    // forwards it into an `OrderUpdated` that panics the restored market-type `update()` assert.
+    if order_type_has_limit_price(order_type) {
+        report.price = Some(price);
+    }
     report.post_only = order.order_type == BinanceFuturesOrderType::Limit
         && order.time_in_force == BinanceTimeInForce::Gtx;
 
-    if let Some(stop_price) =
-        parse_optional_positive_price_at_precision(&order.stop_price, price_precision)
+    if order_type_has_trigger_price(order_type)
+        && let Some(stop_price) =
+            parse_optional_positive_price_at_precision(&order.stop_price, price_precision)
     {
         report.trigger_price = Some(stop_price);
     }
@@ -336,11 +342,17 @@ pub fn parse_futures_algo_update_to_order_status(
         None, // report_id
     );
 
-    if let Some(price) = price {
+    // GOLDMINE null-at-source: only carry price/trigger for the order types that actually have them,
+    // so a reconciliation OrderUpdated never trips the restored market/limit model asserts.
+    if order_type_has_limit_price(order_type)
+        && let Some(price) = price
+    {
         report.price = Some(price);
     }
 
-    if let Some(trigger_price) = trigger_price {
+    if order_type_has_trigger_price(order_type)
+        && let Some(trigger_price) = trigger_price
+    {
         report.trigger_price = Some(trigger_price);
         report.trigger_type = Some(parse_working_type(algo_data.working_type));
     }
@@ -526,6 +538,40 @@ fn parse_order_status(status: BinanceOrderStatus, treat_expired_as_canceled: boo
     }
 }
 
+/// Whether a Nautilus order type carries a limit price.
+///
+/// GOLDMINE null-at-source guard: the market-like types (`Market`/`StopMarket`/`MarketIfTouched`/
+/// `TrailingStopMarket`) have NO limit price, and their model `update()` asserts `price.is_none()`.
+/// Binance sends `original_price="0"` on these, so an unconditional `report.price = Some(price)` would
+/// carry a `Some(0.00)` that a qty-only reconciliation forwards into an `OrderUpdated` → panic. Only
+/// carry a price for order types that actually have a limit price.
+pub(crate) fn order_type_has_limit_price(order_type: OrderType) -> bool {
+    matches!(
+        order_type,
+        OrderType::Limit
+            | OrderType::StopLimit
+            | OrderType::LimitIfTouched
+            | OrderType::MarketToLimit
+            | OrderType::TrailingStopLimit
+    )
+}
+
+/// Whether a Nautilus order type carries a trigger price.
+///
+/// GOLDMINE null-at-source guard: non-triggerable types (`Market`/`Limit`/`MarketToLimit`) assert
+/// `trigger_price.is_none()` in their model `update()`, so a stray trigger must never be attached.
+pub(crate) fn order_type_has_trigger_price(order_type: OrderType) -> bool {
+    matches!(
+        order_type,
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
+            | OrderType::TrailingStopMarket
+            | OrderType::TrailingStopLimit
+    )
+}
+
 fn parse_futures_order_type(order_type: BinanceFuturesOrderType) -> OrderType {
     match order_type {
         BinanceFuturesOrderType::Limit => OrderType::Limit,
@@ -610,6 +656,55 @@ mod tests {
         assert_eq!(report.order_type, OrderType::TrailingStopMarket);
         assert_eq!(report.venue_order_id, VenueOrderId::new("8886774"));
         assert_eq!(report.client_order_id, Some(ClientOrderId::from("TEST")));
+    }
+
+    /// GOLDMINE regression (null-at-source, market-order price): a MARKET order status report must NOT
+    /// carry a price. Binance sends `original_price="0"` (or a stray nonzero) on market orders; the
+    /// previous unconditional `report.price = Some(price)` produced `Some(...)`, which a qty-only
+    /// reconciliation forwards into an `OrderUpdated` that panics the restored `MarketOrder::update`
+    /// `assert!(price.is_none())`. The adapter must null it at the source.
+    #[rstest]
+    fn test_parse_order_update_market_order_carries_no_price() {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.order_type = BinanceFuturesOrderType::Market;
+        msg.order.original_price = "7100.50".to_string(); // stray venue price on a market order
+        msg.order.stop_price = "0".to_string();
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(
+            report.price, None,
+            "a MARKET order report must never carry a price (would panic MarketOrder::update)"
+        );
+        assert_eq!(report.trigger_price, None);
+
+        // Control: a LIMIT order keeps its legitimate price.
+        let mut limit: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        limit.order.order_type = BinanceFuturesOrderType::Limit;
+        limit.order.original_price = "7100.50".to_string();
+        let limit_report = parse_futures_order_update_to_order_status(
+            &limit,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+        assert_eq!(limit_report.order_type, OrderType::Limit);
+        assert_eq!(limit_report.price, Some(Price::from("7100.50")));
     }
 
     #[rstest]

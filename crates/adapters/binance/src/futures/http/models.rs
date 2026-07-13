@@ -51,7 +51,10 @@ use crate::{
         models::BinanceRateLimit,
         parse::parse_required_decimal,
     },
-    futures::conversions::normalize_futures_asset,
+    futures::{
+        conversions::normalize_futures_asset,
+        websocket::streams::parse_exec::{order_type_has_limit_price, order_type_has_trigger_price},
+    },
 };
 
 /// Server time response from `GET /fapi/v1/time`.
@@ -1139,7 +1142,12 @@ impl BinanceFuturesOrder {
             Some(UUID4::new()),
         );
 
-        if let Some(price) = price {
+        // GOLDMINE null-at-source: a market-like order type (Market/StopMarket/MarketIfTouched/
+        // TrailingStopMarket) has no limit price; carrying one would panic the restored market-type
+        // model `update()` on a reconciliation OrderUpdated. Only attach a price for limit-carrying types.
+        if order_type_has_limit_price(order_type)
+            && let Some(price) = price
+        {
             report = report.with_price(price);
         }
 
@@ -1479,13 +1487,20 @@ impl BinanceFuturesAlgoOrder {
             Some(UUID4::new()),
         );
 
-        if let Some(price) = price {
+        // GOLDMINE null-at-source: only carry price/trigger for the order types that actually have them
+        // (see `order_type_has_limit_price` / `order_type_has_trigger_price`), so a reconciliation
+        // OrderUpdated never trips the restored market/limit model asserts.
+        if order_type_has_limit_price(order_type)
+            && let Some(price) = price
+        {
             report = report.with_price(price);
         }
 
         report.avg_px = avg_px;
 
-        if let Some(trigger_price) = trigger_price {
+        if order_type_has_trigger_price(order_type)
+            && let Some(trigger_price) = trigger_price
+        {
             report = report
                 .with_trigger_price(trigger_price)
                 .with_trigger_type(parse_working_type(self.working_type));

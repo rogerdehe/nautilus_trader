@@ -53,7 +53,7 @@ use super::{
 };
 use crate::{
     common::{
-        enums::BybitOrderStatus,
+        enums::{BybitOrderStatus, BybitOrderType, BybitStopOrderType},
         parse::{
             make_bybit_symbol, parse_millis_timestamp, parse_price_with_precision,
             parse_quantity_with_precision,
@@ -594,6 +594,22 @@ fn dispatch_execution_fill(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) {
+    // Funding settlements arrive on the `execution` stream carrying the position's
+    // qty + side but do NOT change the position. Emitting them as fills manufactures
+    // phantom position churn (a paired open+undo) on every funding tick, corrupting
+    // the position cache and firing bogus fill notifications. Skip them here — funding
+    // is reflected in the wallet balance via account-state updates, not fills.
+    if exec.exec_type.is_funding() {
+        log::debug!(
+            "Skipping funding-settlement execution (not a trade): symbol={}, side={:?}, qty={}, price={}",
+            exec.symbol,
+            exec.side,
+            exec.exec_qty,
+            exec.exec_price,
+        );
+        return;
+    }
+
     if exec.exec_type.is_exchange_generated() {
         log::warn!(
             "Exchange-generated execution: exec_type={:?}, symbol={}, order_id={}, order_link_id={}, side={:?}, qty={}, price={}",
@@ -999,13 +1015,33 @@ fn parse_order_snapshot(
     let quantity =
         parse_quantity_with_precision(&order.qty, instrument.size_precision(), "order.qty").ok()?;
 
-    let price = if !order.price.is_empty() && order.price != "0" {
+    // GOLDMINE PATCH (market-order price, live-node panic-safety): a MARKET order has no limit price.
+    // Bybit still populates the `price` field on a market order's status/execution message (e.g. the
+    // last/executed price), and the previous unconditional parse copied it into the emitted
+    // `OrderUpdated.price`. When that update was applied to a Nautilus `MarketOrder`, its
+    // `update()` asserts `event.price.is_none()` → panic → live node crash (canary: ETHFI/GRAM/MNT
+    // market orders, right after OrderAccepted). A market order's fill price flows via OrderFilled,
+    // never OrderUpdated, so the correct fix is to NEVER carry a price on a market-order snapshot.
+    // (Limit orders keep their price; this only nulls the MARKET case.)
+    let price = if matches!(order.order_type, BybitOrderType::Market) {
+        None
+    } else if !order.price.is_empty() && order.price != "0" {
         parse_price_with_precision(&order.price, instrument.price_precision(), "order.price").ok()
     } else {
         None
     };
 
-    let trigger_price = if !order.trigger_price.is_empty() && order.trigger_price != "0" {
+    // GOLDMINE PATCH (non-conditional trigger, live-node panic-safety): a NON-conditional order (plain
+    // Market/Limit — `stop_order_type == None`) has no trigger price. Bybit can still populate a stray
+    // `triggerPrice`; carrying it into `OrderUpdated.trigger_price` would panic a Nautilus
+    // Limit/MarketToLimit/Market `update()` (which assert `trigger_price.is_none()`). Null it at the
+    // source for definitively-non-conditional orders. CONDITIONAL orders (Stop/TakeProfit/StopLoss/
+    // TrailingStop/…) legitimately amend their trigger, so those keep it; an `Unknown` stop type also
+    // keeps it (only nulled when we are certain the order is non-conditional).
+    let is_non_conditional = matches!(order.stop_order_type, BybitStopOrderType::None);
+    let trigger_price = if is_non_conditional {
+        None
+    } else if !order.trigger_price.is_empty() && order.trigger_price != "0" {
         parse_price_with_precision(
             &order.trigger_price,
             instrument.price_precision(),
@@ -1709,6 +1745,32 @@ mod tests {
         assert_eq!(updated.price, Some(Price::from("30000.00")));
     }
 
+    /// GOLDMINE regression (live-node panic-safety): Bybit populates `price` on a MARKET order's
+    /// status message, but a MARKET order's `OrderUpdated` must NEVER carry a price — applying it to a
+    /// Nautilus `MarketOrder` would hit `assert!(event.price.is_none())` and PANIC the live node
+    /// (canary: ETHFI/GRAM/MNT). The adapter must null the price at the source for market orders.
+    #[rstest]
+    fn test_dispatch_market_order_update_never_carries_price() {
+        let mut ctx = DispatchTestContext::new();
+        let mut value = new_order_value();
+        // A MARKET order that (as Bybit does) still carries a non-zero price field.
+        value["data"][0]["orderType"] = serde_json::Value::String("Market".to_string());
+        ctx.accept_order(&value);
+
+        let mut amended = value;
+        amended["data"][0]["price"] = serde_json::Value::String("31000".to_string());
+        amended["data"][0]["qty"] = serde_json::Value::String("0.020".to_string());
+        ctx.dispatch_value(&amended);
+
+        let updated = ctx.recv_updated();
+        assert_eq!(updated.quantity, Quantity::from("0.020"), "qty amend still applies");
+        assert_eq!(
+            updated.price, None,
+            "a MARKET order's OrderUpdated must never carry a price (would panic MarketOrder::update)"
+        );
+        assert_eq!(updated.trigger_price, None);
+    }
+
     #[rstest]
     fn test_dispatch_order_updated_on_trigger_price_change() {
         let mut ctx = DispatchTestContext::new();
@@ -2324,6 +2386,43 @@ mod tests {
         assert_eq!(snapshot.price, expected_price);
         assert_eq!(snapshot.trigger_price, expected_trigger);
         assert_eq!(snapshot.quantity, Quantity::from("0.010"));
+    }
+
+    /// GOLDMINE regression: a NON-conditional order (`stopOrderType == ""`) must NEVER carry a
+    /// `trigger_price` in its snapshot even if Bybit populates one — carrying it into OrderUpdated would
+    /// panic a Nautilus Limit/MarketToLimit `update()` (asserts `trigger_price.is_none()`). A CONDITIONAL
+    /// order keeps its legitimate trigger.
+    #[rstest]
+    fn test_parse_order_snapshot_nulls_trigger_for_non_conditional() {
+        let instrument = linear_instrument();
+
+        // Non-conditional limit with a stray triggerPrice → trigger nulled at source.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_account_order.json")).unwrap();
+        value["data"][0]["orderType"] = serde_json::Value::String("Limit".to_string());
+        value["data"][0]["stopOrderType"] = serde_json::Value::String(String::new());
+        value["data"][0]["triggerPrice"] = serde_json::Value::String("29000".to_string());
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_value(value).unwrap();
+        let snapshot = parse_order_snapshot(&msg.data[0], &instrument).unwrap();
+        assert_eq!(
+            snapshot.trigger_price, None,
+            "non-conditional order must not carry a trigger_price (would panic Limit::update)"
+        );
+
+        // Control: a CONDITIONAL order (stopOrderType set) keeps its legitimate trigger.
+        let mut value2: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_account_order.json")).unwrap();
+        value2["data"][0]["stopOrderType"] = serde_json::Value::String("StopLoss".to_string());
+        value2["data"][0]["triggerPrice"] = serde_json::Value::String("29000".to_string());
+        let msg2: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_value(value2).unwrap();
+        let snapshot2 = parse_order_snapshot(&msg2.data[0], &instrument).unwrap();
+        assert_eq!(
+            snapshot2.trigger_price,
+            Some(Price::from("29000.00")),
+            "conditional order must keep its legitimate trigger_price"
+        );
     }
 
     #[rstest]
