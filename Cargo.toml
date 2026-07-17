@@ -4,6 +4,12 @@ members = [
   "crates",
   "crates/adapters/architect_ax",
   "crates/adapters/betfair",
+  "crates/adapters/bingx",
+  "crates/adapters/bitget",
+  "crates/adapters/gate",
+  "crates/adapters/hashkey",
+  "crates/adapters/kucoin",
+  "crates/adapters/mexc",
   "crates/adapters/binance",
   "crates/adapters/bitmex",
   "crates/adapters/blockchain",
@@ -100,6 +106,12 @@ nautilus-trading = { path = "crates/trading", version = "0.61.0" }
 # -----------------------------------------------------------------------------
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.61.0" }
 nautilus-betfair = { path = "crates/adapters/betfair", version = "0.61.0", default-features = false }
+nautilus-bingx = { path = "crates/adapters/bingx", version = "0.61.0", default-features = false }
+nautilus-bitget = { path = "crates/adapters/bitget", version = "0.61.0", default-features = false }
+nautilus-gate = { path = "crates/adapters/gate", version = "0.61.0", default-features = false }
+nautilus-hashkey = { path = "crates/adapters/hashkey", version = "0.61.0", default-features = false }
+nautilus-kucoin = { path = "crates/adapters/kucoin", version = "0.61.0", default-features = false }
+nautilus-mexc = { path = "crates/adapters/mexc", version = "0.61.0", default-features = false }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.61.0", default-features = false }
 nautilus-bitmex = { path = "crates/adapters/bitmex", version = "0.61.0", default-features = false }
 nautilus-blockchain = { path = "crates/adapters/blockchain", version = "0.61.0" }
