@@ -14,8 +14,60 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Serde models for LBank v2 spot REST responses.
+//!
+//! Numeric decimal fields are captured as strings via [`FlexStr`] because LBank returns them as JSON
+//! *numbers* over WebSocket (`42585.84`) but as *strings* over some REST endpoints; keeping the raw
+//! token avoids an f64 round-trip when building `Price`/`Quantity`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de};
+
+/// A decimal value that deserializes from either a JSON string or a JSON number, storing the raw
+/// textual token (no f64 round-trip). Used for prices/sizes across REST + WS payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlexStr(pub String);
+
+impl FlexStr {
+    /// Returns the underlying decimal string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for FlexStr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct V;
+        impl de::Visitor<'_> for V {
+            type Value = FlexStr;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a decimal string or number")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<FlexStr, E> {
+                Ok(FlexStr(v.to_string()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<FlexStr, E> {
+                Ok(FlexStr(v))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<FlexStr, E> {
+                // Rust's f64 Display is shortest-roundtrip DECIMAL (no scientific notation for the
+                // magnitudes seen here), which parses cleanly into `rust_decimal::Decimal`.
+                Ok(FlexStr(v.to_string()))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<FlexStr, E> {
+                Ok(FlexStr(v.to_string()))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<FlexStr, E> {
+                Ok(FlexStr(v.to_string()))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
 
 /// Generic LBank v2 response envelope: `{"result":..,"data":..,"error_code":0,"msg":..}`.
 /// `error_code == 0` (or a truthy `result`) means success.
@@ -26,6 +78,117 @@ pub struct LBankResponse<T> {
     #[serde(default)]
     pub msg: Option<String>,
     pub data: Option<T>,
+}
+
+/// A `[price, qty]` order book level (numbers over WS, strings over REST).
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankLevel(pub FlexStr, pub FlexStr);
+
+/// Response of `GET /v2/depth.do` (and the WS `depth` push payload).
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankDepth {
+    /// Ask levels (ascending price).
+    #[serde(default)]
+    pub asks: Vec<LBankLevel>,
+    /// Bid levels (descending price).
+    #[serde(default)]
+    pub bids: Vec<LBankLevel>,
+}
+
+/// One trade from `GET /v2/supplement/trades.do`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankRestTrade {
+    /// Trade price.
+    pub price: FlexStr,
+    /// Trade quantity (base).
+    pub qty: FlexStr,
+    /// Trade time in milliseconds.
+    #[serde(default)]
+    pub time: Option<i64>,
+    /// Trade id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// `true` when the buyer was the maker (→ taker/aggressor is the seller).
+    #[serde(rename = "isBuyerMaker", default)]
+    pub is_buyer_maker: Option<bool>,
+}
+
+/// Request parameters for `POST /v2/supplement/create_order.do` (business params; the signed system
+/// params `api_key`/`echostr`/`signature_method`/`timestamp`/`sign` are added by the client).
+#[derive(Clone, Debug)]
+pub struct LBankCreateOrderRequest {
+    /// LBank pair, e.g. `btc_usdt`.
+    pub symbol: String,
+    /// Order `type`: `buy`/`sell` (limit) and suffixed variants (`_ioc`/`_fok`/`_maker`/`_market`).
+    pub order_type: String,
+    /// Limit price (quote).
+    pub price: String,
+    /// Order amount (base for limit/sell-market; quote spend for buy-market).
+    pub amount: String,
+    /// Optional client order id (`custom_id`).
+    pub custom_id: Option<String>,
+}
+
+/// Response `data` of `POST /v2/supplement/create_order.do`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankCreateOrderResult {
+    /// Venue order id.
+    #[serde(default)]
+    pub order_id: Option<String>,
+    /// Echoed client order id.
+    #[serde(default)]
+    pub custom_id: Option<String>,
+    /// Echoed symbol.
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
+/// Response `data` of `POST /v2/supplement/cancel_order.do`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankCancelOrderResult {
+    /// Venue order id.
+    #[serde(default, alias = "order_id")]
+    pub order_id: Option<String>,
+    /// Order status code (see `parse_order_status`).
+    #[serde(default)]
+    pub status: Option<i64>,
+}
+
+/// One balance row from `POST /v2/supplement/user_info_account.do` (`data.balances[]`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankBalance {
+    /// Asset code (lowercase, e.g. `usdt`).
+    pub asset: String,
+    /// Free/available balance.
+    #[serde(default)]
+    pub free: Option<FlexStr>,
+    /// Locked balance.
+    #[serde(default)]
+    pub locked: Option<FlexStr>,
+}
+
+/// Response `data` of `POST /v2/supplement/user_info_account.do`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankAccount {
+    /// Per-asset balances.
+    #[serde(default)]
+    pub balances: Vec<LBankBalance>,
+}
+
+/// Marker so [`LBankCreateOrderRequest`] participates in `Serialize`-generic contexts if needed.
+impl Serialize for LBankCreateOrderRequest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("symbol", &self.symbol)?;
+        m.serialize_entry("type", &self.order_type)?;
+        m.serialize_entry("price", &self.price)?;
+        m.serialize_entry("amount", &self.amount)?;
+        if let Some(cid) = &self.custom_id {
+            m.serialize_entry("custom_id", cid)?;
+        }
+        m.end()
+    }
 }
 
 /// One row of `/v2/accuracy.do` (precision + order-size filters for a spot pair).

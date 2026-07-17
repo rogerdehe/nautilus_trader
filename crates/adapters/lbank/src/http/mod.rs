@@ -13,7 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! LBank v2 spot REST: response models and parsing (HTTP client added next).
+//! LBank v2 spot REST: signed client, response models, parsing, and error envelope handling.
 
+pub mod client;
+pub mod error;
 pub mod models;
 pub mod parse;

@@ -21,6 +21,9 @@ use ustr::Ustr;
 /// The canonical Nautilus venue string for LBank.
 pub const LBANK_VENUE: &str = "LBANK";
 
+/// The adapter/client name used by factories.
+pub const LBANK: &str = "LBANK";
+
 /// Returns the [`Venue`] identifier for LBank.
 #[must_use]
 pub fn lbank_venue() -> Venue {
@@ -53,3 +56,21 @@ pub const EP_ACCOUNT: &str = "/v2/supplement/user_info_account.do";
 
 /// `signature_method` value for HMAC-SHA256 keys.
 pub const SIGNATURE_METHOD_HMAC: &str = "HmacSHA256";
+
+// WebSocket subscription actions/channels (spot public).
+pub const WS_ACTION_SUBSCRIBE: &str = "subscribe";
+pub const WS_ACTION_PONG: &str = "pong";
+pub const WS_SUBSCRIBE_DEPTH: &str = "depth";
+pub const WS_SUBSCRIBE_TRADE: &str = "trade";
+
+/// Default order book snapshot depth requested over WebSocket (LBank allows 10/50/100).
+pub const WS_DEPTH_LEVELS: u32 = 100;
+
+/// Default order book snapshot depth requested over REST `depth.do` (1-200).
+pub const REST_DEPTH_SIZE: u32 = 100;
+
+/// Default REST recent-trades page size for `supplement/trades.do`.
+pub const REST_TRADES_SIZE: u32 = 100;
+
+/// CCXT `describe().rateLimit` for LBank spot (~60 ms/token → ~16 req/s).
+pub const LBANK_RATE_LIMIT_MS: u64 = 60;

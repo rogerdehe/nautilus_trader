@@ -6588,6 +6588,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-lc-rs",
+ "bon",
  "chrono",
  "dashmap",
  "dotenvy",

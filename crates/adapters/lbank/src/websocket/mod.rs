@@ -13,18 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [LBank](https://www.lbank.com) integration adapter for the NautilusTrader platform.
-//!
-//! Spot market data + execution over LBank's v2 REST + WebSocket API. Signing, endpoints and message
-//! shapes are implemented first-hand against the CCXT reference (`ccxt/python/ccxt/lbank.py` +
-//! `pro/lbank.py`): HmacSHA256-over-uppercased-MD5 request signing, `btc_usdt` symbol format,
-//! `wss://www.lbkex.net/ws/V2/` full-snapshot depth + trade streams.
+//! LBank spot WebSocket layer: full-snapshot depth + trade streams with app-level ping/pong.
 
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-pub mod provider;
-pub mod websocket;
+pub mod client;
+pub mod messages;
+pub mod parse;
