@@ -13,18 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [Bitget](https://www.bitget.com) integration adapter for the NautilusTrader platform.
-//!
-//! Spot market data + execution over Bitget's v2 REST + WebSocket API. Signing, endpoints and
-//! message shapes are implemented first-hand against the CCXT reference
-//! (`ccxt/python/ccxt/bitget.py` + `pro/bitget.py`): `base64(HMAC_SHA256(secret, ts+method+path+body))`
-//! request signing with `ACCESS-*` headers + passphrase, concatenated `BTCUSDT` symbol format, and
-//! `wss://ws.bitget.com/v2/ws/public` depth + trade streams.
+//! Bitget v2 WebSocket client, message models, and parsing.
 
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-pub mod websocket;
+pub mod client;
+pub mod messages;
+pub mod parse;
