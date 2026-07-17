@@ -100,13 +100,17 @@ adapter set. The following limits remain deferred:
 - Changed Blockchain fee-protocol update and snapshot storage to use `INTEGER` protocol-fee shares; run `make init-db`
 
 ### Fixes
+- Fixed v2 PyO3 API coverage and Python exception handling
+- Fixed Architect AX data and execution clients not refreshing authentication tokens for REST requests and WebSocket reconnects
 - Fixed v2 `BettingInstrument` catalog round trips deriving `raw_symbol` from the instrument ID and rebuilding `price_increment`/`size_increment` from precision, corrupting their values
 - Fixed v2 `FuturesContract`, `OptionContract`, `BinaryOption`, and `BettingInstrument` catalog round trips dropping quantity, price, and notional constraints, margins, and fees
+- Fixed `OrderFactory.bracket` `tp_post_only` docs (#4437), thanks for reporting @jh171717 and for the patch @chang-pro
 - Fixed v2 realized PnL returning zero for missing rates or range errors and panicking on overflow
 - Fixed v2 portfolio snapshots retaining stale-price flags after the affected position side closed
 - Fixed v2 portfolio snapshots dropping temporarily unpriced positions and hiding stale valuations
 - Fixed v2 account-scoped valuations clearing other accounts' missing-price flags on shared venues
 - Fixed v2 account locks and margins using settlement currency instead of each calculated currency
+- Fixed v2 portfolio pending recovery discarding initial margin after recalculating maintenance margin
 - Fixed v2 invalid or out-of-range notional and PnL valuations panicking or falling back to zero
 - Fixed v2 multi-currency cash equity double-counting assets already credited to account balances
 - Fixed v2 quanto position notionals using quote currency instead of settlement currency
@@ -187,6 +191,7 @@ adapter set. The following limits remain deferred:
 - Fixed Binance Futures algo orders to consume USD-M order-count limits (#4395), thanks for reporting @cjdsellers
 - Fixed Binance Futures inflight query falsely rejecting untriggered algo orders (#4411), thanks @reijz
 - Fixed Binance Futures historical algo order queries (#4449), thanks @KaizynX
+- Fixed Polymarket v1 and v2 allowance commands to approve the current Neg Risk adapter
 - Fixed Binance Futures startup reconciliation omitting and truncating venue fill history
 - Fixed Binance Spot startup reconciliation omitting and truncating venue fill history
 - Fixed Binance Spot instrument loading after the SBE schema `3:5` rollout (#4407), thanks for reporting @learnerLj
@@ -212,6 +217,7 @@ adapter set. The following limits remain deferred:
 - Fixed Architect AX REST models and query params for current ticker, order, and transaction schemas (#4402)
 - Fixed OKX price-limit metadata parsing and public limit-price requests (#4413)
 - Fixed Polymarket RTDS retained-subscription recovery after reconnects (#4353), thanks @graceyangfan
+- Fixed Polymarket Gamma discovery to use keyset pagination beyond the legacy offset cap
 - Fixed Polymarket v2 order cancellation during shutdown so accepted venue orders are not left open
 - Fixed Polymarket v2 book delta atomicity and local limit-price range validation
 - Fixed Polymarket v2 execution races, ambiguous submissions, trade finality, fill IDs, and proxy funder validation
@@ -220,6 +226,7 @@ adapter set. The following limits remain deferred:
 - Fixed Tardis replay bars directory to `bars/` for catalog compatibility (#4378), thanks @AdvancedUno
 - Fixed Hyperliquid `l2Book` resubscribe options and shared stream teardown (#4298)
 - Fixed Hyperliquid PyO3 order book depth subscriptions (#4381), thanks @graceyangfan
+- Fixed Hyperliquid Rust public trade responses dropping instrument identifiers
 - Fixed Hyperliquid order modification to use cached CLOID targets when safe, with a numeric OID fallback
 - Fixed Hyperliquid rapid chained order modifications to preserve each in-flight cancel-replace, so a later modify no longer drops an earlier one's cancel-suppression and a failed modify no longer clears newer queued modifications
 - Fixed Interactive Brokers execution timestamp parsing for non-UTC time zones (#4396), thanks for reporting @dfjmax
@@ -227,6 +234,7 @@ adapter set. The following limits remain deferred:
 - Fixed Interactive Brokers v2 tracked fills to emit `OrderFilled` after `OrderAccepted`, emit `OrderRejected` on gateway submission failure, and retain fill identity across terminal callbacks
 - Fixed Interactive Brokers `IneligibilityReason` serialization (#4380), thanks @xxxxxx-oss
 - Fixed Interactive Brokers Docker gateway startup to ignore the active Docker context
+- Fixed Kraken Futures batch order `order_tag` serialization (#4459), thanks for reporting @Andreas197510
 - Fixed Lighter batch orders to use correlated sequential WebSocket transactions
 - Fixed Lighter reconciliation cursor loops, fill deduplication, and trailing fill identity
 - Fixed Lighter instrument parsing, gap candle filtering, and spot quote currencies
@@ -237,6 +245,7 @@ adapter set. The following limits remain deferred:
 - Improved core decimal deserialization to round fractional scales above 28 digits instead of erroring
 - Improved live reconciliation recency tracking with `RecencyMap` (#4386), thanks @folknor
 - Improved portfolio statistics test coverage with canonical worked examples
+- Improved Lighter signing latency through faster quintic field multiplication and squaring
 - Improved Lighter signing and execution coverage for conditional, IOC, cancel-all, and leverage transactions
 - Made portfolio reference-count clones explicit (#4364), thanks @ChrisAB
 - Upgraded Binance Spot SBE REST and WebSocket API requests to schema `3:5` (Rust)
