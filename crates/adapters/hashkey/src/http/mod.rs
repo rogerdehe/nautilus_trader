@@ -13,18 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [HashKey Global](https://global.hashkey.com) integration adapter for the NautilusTrader platform.
-//!
-//! Spot market data + execution over HashKey's v1 REST + WebSocket API. Signing, endpoints and
-//! message shapes are implemented first-hand against the CCXT reference (`ccxt/python/ccxt/hashkey.py`
-//! + `pro/hashkey.py`): `HMAC_SHA256(secret, custom_urlencode(params))` request signing (insertion
-//! order, `timestamp` first), Binance-style `BTCUSDT` symbol ids, and the
-//! `wss://stream-glb.hashkey.com/quote/ws/v1` full-snapshot depth + trade streams.
+//! HTTP/REST client implementation for the HashKey Global v1 API.
 
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-pub mod websocket;
+pub mod client;
+pub mod error;
+pub mod models;
+pub mod parse;
+
+pub use crate::http::client::{HashKeyHttpClient, HashKeyInstrumentProvider};
