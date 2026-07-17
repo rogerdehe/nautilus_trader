@@ -169,14 +169,17 @@ fn parse_ws_trade(
         .ts
         .as_deref()
         .map_or(ts_init, |s| parse_ws_ts(s, ts_init));
+    // LBank spot WS trades carry no native trade id, so synthesize a stable one. It MUST stay within
+    // nautilus `TradeId`'s 36-char stack-string limit — the old `{ts}-{price}-{volume}` form reached
+    // 42 chars and PANICKED nautilus core (Condition: String exceeds maximum length of 36). Hash the
+    // price+volume into 8 hex chars: `{ts_nanos}` (≤20) + `-` + 8 = ≤29 chars, still uniquely keyed
+    // by (time, price, volume) for dedup.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    trade.price.as_str().hash(&mut hasher);
+    trade.volume.as_str().hash(&mut hasher);
     let trade_id = TradeId::new(
-        format!(
-            "{}-{}-{}",
-            ts_event.as_u64(),
-            trade.price.as_str(),
-            trade.volume.as_str()
-        )
-        .as_str(),
+        format!("{}-{:08x}", ts_event.as_u64(), hasher.finish() as u32).as_str(),
     );
     TradeTick::new_checked(
         instrument_id,
@@ -269,6 +272,9 @@ mod tests {
                 assert_eq!(t.aggressor_side, AggressorSide::Seller);
                 assert_eq!(t.price, Price::from("12129.00"));
                 assert_eq!(t.ts_event.as_u64(), 1_561_751_749_460_000_000);
+                // Regression: synthesized trade_id MUST fit nautilus TradeId's 36-char stack limit
+                // (the old `ts-price-volume` form was 42 chars and panicked nautilus core).
+                assert!(t.trade_id.to_string().len() <= 36, "trade_id too long: {}", t.trade_id);
             }
             other => panic!("expected trade, got {other:?}"),
         }
