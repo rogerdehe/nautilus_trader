@@ -53,6 +53,10 @@ pub struct BitgetDataClient {
     ws_handle: Option<Arc<WebSocketClient>>,
     is_connected: AtomicBool,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    /// Paces outbound subscribe frames: Bitget WS rejects bursts with `[30006] request too many`
+    /// (~10 req/s cap). Recording 50 instruments × 2 channels fires 100 frames at once; this gate
+    /// serializes them to ≤~8/s. Holds the last-send instant shared across the spawned send tasks.
+    sub_pacer: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl std::fmt::Debug for BitgetDataClient {
@@ -92,6 +96,7 @@ impl BitgetDataClient {
             ws_handle: None,
             is_connected: AtomicBool::new(false),
             data_sender: get_data_event_sender(),
+            sub_pacer: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -101,7 +106,21 @@ impl BitgetDataClient {
             return;
         };
         let channel = channel.to_string();
+        let pacer = self.sub_pacer.clone();
         get_runtime().spawn(async move {
+            // Rate-gate: Bitget WS caps subscribe frames at ~10/s ([30006] "request too many"), so
+            // enforce ≥130ms between frames (≤~7.7/s). Serialized via the shared last-send instant.
+            {
+                let mut last = pacer.lock().await;
+                let min_gap = std::time::Duration::from_millis(130);
+                if let Some(prev) = *last {
+                    let elapsed = prev.elapsed();
+                    if elapsed < min_gap {
+                        tokio::time::sleep(min_gap - elapsed).await;
+                    }
+                }
+                *last = Some(tokio::time::Instant::now());
+            }
             match BitgetWebSocketClient::subscription_text(instrument_id, &channel) {
                 Ok(text) => {
                     if let Err(e) = handle.send_text(text, None).await {
