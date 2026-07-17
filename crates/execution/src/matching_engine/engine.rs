@@ -76,6 +76,211 @@ use crate::{
     trailing::trailing_stop_calculate,
 };
 
+// ============================================================================
+// GOLDMINE (BACKTEST-ONLY) MM queue instrumentation + proportional queue model.
+//
+// WHY: the stock L2/MBP maker-queue model advances our `queue_ahead` with a
+// MONOTONIC RATCHET — `cap_queue_ahead` sets qty_ahead = min(qty_ahead, new_level_size)
+// on every book Update, so each transient dip of a churning wall (cancel+replace)
+// ratchets us toward the wall's historical MINIMUM and never restores when it refills.
+// On thick / wide-spread books this over-advances us → we over-fill on small non-toxic
+// trades → adverse selection is diluted (measured: BT markout −1.95bp vs live −8.56bp,
+// BT 95 fills vs live 60 on OP). See scratchpad/MM_BACKTEST_QUEUE_FIX.md.
+//
+// This block is inert unless env `MM_BT_QTRACE=1` (instrumentation) or
+// `MM_BT_PROPORTIONAL_QUEUE=1` (the alternative queue-advance model) is set, so ALL
+// other backtests and every live path are byte-for-byte unchanged (defaults preserved).
+// ============================================================================
+pub mod gm_qtrace {
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            OnceLock,
+        },
+    };
+
+    use nautilus_model::identifiers::ClientOrderId;
+
+    // Path indices: 0 = real trade (decrement_queue_on_trade),
+    //               1 = level delete  (clear_queue_on_delete),
+    //               2 = level update  (cap_queue_ahead),
+    //               3 = PLACED-AT-ZERO (order joined a price with no resting depth ahead →
+    //                   fills on the next trade to reach it; never passes through a reduce path),
+    //               4 = SNAPSHOT reset (clear_all_queue_positions zeroes EVERY resting order on the
+    //                   recorder's periodic full-book snapshot — a recorder artifact with no venue
+    //                   counterpart; teleports us to the front of the queue).
+    pub const PATHS: [&str; 5] = ["TRADE", "DELETE", "CAP", "PLACED0", "SNAPSHOT"];
+    pub static QTY_REDUCED: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    pub static EVENTS: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    pub static ZERO_EVENTS: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    pub static FILLS_UNBLOCKED: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    // Placement census (independent of fills): total maker placements, and those at qty_ahead==0.
+    pub static PLACED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static PLACED_ZERO: AtomicU64 = AtomicU64::new(0);
+    // Denominator: total maker fill EVENTS (every proceeding fill_limit_order), so attributed
+    // fills_unblocked can be reconciled against the true fill-event count.
+    pub static FILL_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn qtrace_enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("MM_BT_QTRACE").as_deref() == Ok("1"))
+    }
+
+    pub fn proportional_enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("MM_BT_PROPORTIONAL_QUEUE").as_deref() == Ok("1"))
+    }
+
+    /// PRIMARY FIX (MM_BT_SNAP_PRESERVE=1): treat the recorder's periodic full-book snapshot as
+    /// what it is — a data refresh, NOT a venue queue reset. Carry `queue_ahead_total` through the
+    /// snapshot untouched instead of zeroing every resting order (the default `clear_all_queue_positions`
+    /// behavior, which teleports us to the front of the queue every ~60s and drove 68% of OP's fills).
+    pub fn snapshot_preserve_enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("MM_BT_SNAP_PRESERVE").as_deref() == Ok("1"))
+    }
+
+    /// ALTERNATIVE (MM_BT_SNAP_REDERIVE=1): on a snapshot, re-derive each resting order's queue
+    /// position from the freshly-rebuilt book (full current depth ahead) instead of zeroing. More
+    /// pessimistic than PRESERVE (discards queue progress made by real trades since placement).
+    pub fn snapshot_rederive_enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("MM_BT_SNAP_REDERIVE").as_deref() == Ok("1"))
+    }
+
+    /// Power exponent `k` applied to the cancelled fraction in the proportional queue model:
+    /// `reduction = qty_ahead · (Δ/prev)^k`.
+    ///   * k = 1 → linear/uniform-cancel (every cancel counts by its ahead-fraction). On churning
+    ///     walls this erodes `qty_ahead` to ~0 by a thousand small cuts → still over-fills.
+    ///   * k > 1 → suppresses tiny transient churn cancels ((0.001)^2 ≈ 0) while preserving genuine
+    ///     large wall departures ((0.5)^2 = 0.25, full delete (1)^k = 1) — this is the hftbacktest
+    ///     power-prob queue family. Tuned against live fill-count + markout.
+    pub fn queue_exponent() -> f64 {
+        static E: OnceLock<f64> = OnceLock::new();
+        *E.get_or_init(|| {
+            std::env::var("MM_BT_QUEUE_EXP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0)
+        })
+    }
+
+    thread_local! {
+        // Per-order: which path last drove its qty_ahead to 0 (fill-unblocking attribution).
+        static LAST_ZERO: RefCell<HashMap<ClientOrderId, u8>> = RefCell::new(HashMap::new());
+    }
+
+    /// Record a `queue_ahead` reduction for one of our maker orders on `path`.
+    pub fn record_reduction(path: usize, reduced: u64, new_ahead: u64, coid: ClientOrderId) {
+        if !qtrace_enabled() || reduced == 0 {
+            return;
+        }
+        QTY_REDUCED[path].fetch_add(reduced, Ordering::Relaxed);
+        EVENTS[path].fetch_add(1, Ordering::Relaxed);
+        if new_ahead == 0 {
+            ZERO_EVENTS[path].fetch_add(1, Ordering::Relaxed);
+            LAST_ZERO.with(|m| {
+                m.borrow_mut().insert(coid, path as u8);
+            });
+        }
+    }
+
+    /// Census a maker placement: total, and whether it joined at qty_ahead==0.
+    pub fn record_placement(qty_ahead: u64, coid: ClientOrderId) {
+        if !qtrace_enabled() {
+            return;
+        }
+        PLACED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        LAST_ZERO.with(|m| {
+            if qty_ahead == 0 {
+                PLACED_ZERO.fetch_add(1, Ordering::Relaxed);
+                m.borrow_mut().insert(coid, 3); // PLACED0
+            } else {
+                m.borrow_mut().remove(&coid);
+            }
+        });
+    }
+
+    /// Record that one of our orders had its queue zeroed by the snapshot reset (path 4).
+    pub fn record_snapshot_zero(coid: ClientOrderId) {
+        if !qtrace_enabled() {
+            return;
+        }
+        ZERO_EVENTS[4].fetch_add(1, Ordering::Relaxed);
+        LAST_ZERO.with(|m| {
+            m.borrow_mut().insert(coid, 4);
+        });
+    }
+
+    /// Attribute a confirmed maker fill to the path that last cleared its queue.
+    pub fn record_fill(coid: ClientOrderId) {
+        if !qtrace_enabled() {
+            return;
+        }
+        FILL_EVENTS.fetch_add(1, Ordering::Relaxed);
+        LAST_ZERO.with(|m| {
+            if let Some(&p) = m.borrow().get(&coid) {
+                FILLS_UNBLOCKED[p as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub fn dump() {
+        if !qtrace_enabled() {
+            return;
+        }
+        eprintln!(
+            "QTRACE placements: total={} at_zero_ahead={} | fill_events={}",
+            PLACED_TOTAL.load(Ordering::Relaxed),
+            PLACED_ZERO.load(Ordering::Relaxed),
+            FILL_EVENTS.load(Ordering::Relaxed),
+        );
+        eprintln!("QTRACE queue-reduction path breakdown (our maker orders only):");
+        for i in 0..5 {
+            eprintln!(
+                "  {:8} qty_reduced={} events={} zero_events={} fills_unblocked={}",
+                PATHS[i],
+                QTY_REDUCED[i].load(Ordering::Relaxed),
+                EVENTS[i].load(Ordering::Relaxed),
+                ZERO_EVENTS[i].load(Ordering::Relaxed),
+                FILLS_UNBLOCKED[i].load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+impl Drop for OrderMatchingEngine {
+    fn drop(&mut self) {
+        gm_qtrace::dump();
+    }
+}
+
 /// An order matching engine for a single market.
 pub struct OrderMatchingEngine {
     /// The venue for the matching engine.
@@ -121,6 +326,13 @@ pub struct OrderMatchingEngine {
     queue_ahead_orders: IndexMap<ClientOrderId, IndexMap<OrderId, QuantityRaw>>,
     queue_ahead_total: IndexMap<ClientOrderId, (PriceRaw, QuantityRaw)>,
     queue_excess: IndexMap<ClientOrderId, QuantityRaw>,
+    /// GOLDMINE proportional-queue model (MM_BT_PROPORTIONAL_QUEUE=1): market depth at the
+    /// current delta's price level, sampled BEFORE `book.apply_delta`, so `cap_queue_ahead`
+    /// can compute the cancelled fraction Δ/prev. Unused when the model is off.
+    qq_prev_size_for_delta: QuantityRaw,
+    /// GOLDMINE snapshot RE-DERIVE model (MM_BT_SNAP_REDERIVE=1): set on a snapshot burst,
+    /// consumed on the next non-snapshot event to re-derive queue positions from the rebuilt book.
+    queue_resnap_pending: bool,
     prev_bid_price_raw: PriceRaw,
     prev_bid_size_raw: QuantityRaw,
     prev_ask_price_raw: PriceRaw,
@@ -207,6 +419,8 @@ impl OrderMatchingEngine {
             queue_ahead_orders: IndexMap::new(),
             queue_ahead_total: IndexMap::new(),
             queue_excess: IndexMap::new(),
+            qq_prev_size_for_delta: 0,
+            queue_resnap_pending: false,
             prev_bid_price_raw: 0,
             prev_bid_size_raw: 0,
             prev_ask_price_raw: 0,
@@ -444,6 +658,7 @@ impl OrderMatchingEngine {
         );
 
         let client_order_id = order.client_order_id();
+        gm_qtrace::record_placement(qty_ahead.raw as u64, client_order_id);
 
         // Clear stale entries from all maps (e.g. order modified to new price)
         self.queue_pending.shift_remove(&client_order_id);
@@ -548,7 +763,7 @@ impl OrderMatchingEngine {
         for (client_order_id, ahead_raw, leaves_raw) in &entries {
             if remaining == 0 {
                 let new_ahead = ahead_raw.saturating_sub(trade_size_raw);
-                self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, new_ahead);
+                self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, new_ahead, 0);
                 if new_ahead == 0 {
                     // Queue cleared but no trade volume left for this order
                     self.queue_excess.insert(*client_order_id, 0);
@@ -563,11 +778,11 @@ impl OrderMatchingEngine {
 
             if remaining == 0 && queue_consumed < gap {
                 let new_ahead = ahead_raw.saturating_sub(trade_size_raw);
-                self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, new_ahead);
+                self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, new_ahead, 0);
                 continue;
             }
 
-            self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, 0);
+            self.reduce_queue_ahead(*client_order_id, price_raw, *ahead_raw, 0, 0);
             let excess = remaining.min(*leaves_raw);
             self.queue_excess.insert(*client_order_id, excess);
             remaining -= excess;
@@ -578,13 +793,21 @@ impl OrderMatchingEngine {
     /// Reduces an order's quantity ahead, front-consuming its tracked orders by
     /// the same amount so the pair stays in sync and later granular deltas for
     /// consumed orders cannot advance the queue again.
+    /// `path`: GOLDMINE qtrace attribution — 0=trade, 1=delete, 2=cap/update.
     fn reduce_queue_ahead(
         &mut self,
         client_order_id: ClientOrderId,
         price_raw: PriceRaw,
         ahead_raw: QuantityRaw,
         new_ahead_raw: QuantityRaw,
+        path: usize,
     ) {
+        gm_qtrace::record_reduction(
+            path,
+            ahead_raw.saturating_sub(new_ahead_raw) as u64,
+            new_ahead_raw as u64,
+            client_order_id,
+        );
         self.queue_ahead_total
             .insert(client_order_id, (price_raw, new_ahead_raw));
         self.consume_queue_ahead_orders(client_order_id, ahead_raw.saturating_sub(new_ahead_raw));
@@ -663,7 +886,10 @@ impl OrderMatchingEngine {
     }
 
     fn clear_all_queue_positions(&mut self) {
-        for (_, (_, ahead_raw)) in &mut self.queue_ahead_total {
+        for (coid, (_, ahead_raw)) in &mut self.queue_ahead_total {
+            if *ahead_raw != 0 {
+                gm_qtrace::record_snapshot_zero(*coid);
+            }
             *ahead_raw = 0;
         }
 
@@ -705,7 +931,7 @@ impl OrderMatchingEngine {
                     .order(&client_order_id)
                     .is_some_and(|o| o.order_side() == deleted_side);
                 if matches_side {
-                    self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, 0);
+                    self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, 0, 1);
                 }
             }
         }
@@ -767,6 +993,10 @@ impl OrderMatchingEngine {
         size_raw: QuantityRaw,
         order_side: OrderSide,
     ) {
+        if gm_qtrace::proportional_enabled() {
+            self.cap_queue_ahead_proportional(price_raw, size_raw, order_side);
+            return;
+        }
         let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
         let mut stale: Vec<ClientOrderId> = Vec::new();
 
@@ -800,7 +1030,82 @@ impl OrderMatchingEngine {
                 continue;
             }
 
-            self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, size_raw);
+            self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, size_raw, 2);
+        }
+
+        for id in stale {
+            self.queue_ahead_total.shift_remove(&id);
+            self.queue_ahead_orders.shift_remove(&id);
+        }
+    }
+
+    /// GOLDMINE proportional cancel-advance queue model (MM_BT_PROPORTIONAL_QUEUE=1).
+    ///
+    /// The stock `cap_queue_ahead` sets `qty_ahead = min(qty_ahead, new_size)` — a monotonic
+    /// ratchet that assumes EVERY cancel happened ahead of us and never restores when the level
+    /// refills. On a churning wall this advances us far too fast. Instead, on a level size change
+    /// prev→new at our price (prev sampled BEFORE `book.apply_delta`, in `qq_prev_size_for_delta`):
+    ///   * net CANCEL (new < prev, Δ = prev − new): reduce `qty_ahead` by `qty_ahead·Δ/prev`
+    ///     — only the fraction of cancels statistically ahead of us (uniform-cancel assumption),
+    ///     not cap-to-new.
+    ///   * net ADD (new ≥ prev): `qty_ahead` UNCHANGED — new liquidity joins the BACK (later time
+    ///     priority), which kills the ratchet.
+    /// (`qty_ahead·Δ/prev ≤ qty_ahead·(prev−new)/prev` and since `qty_ahead ≤ prev`, the result
+    /// never exceeds `new`, so the queue stays book-consistent.)
+    fn cap_queue_ahead_proportional(
+        &mut self,
+        price_raw: PriceRaw,
+        size_raw: QuantityRaw,
+        order_side: OrderSide,
+    ) {
+        let prev = self.qq_prev_size_for_delta;
+        // Net add / unchanged, or missing prev: leave the queue untouched (no ratchet).
+        if prev == 0 || size_raw >= prev {
+            return;
+        }
+        let cancelled = prev - size_raw; // Δ
+
+        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
+        let mut stale: Vec<ClientOrderId> = Vec::new();
+
+        for client_order_id in keys {
+            let (order_price_raw, ahead_raw) =
+                match self.queue_ahead_total.get(&client_order_id).copied() {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+            if order_price_raw != price_raw || ahead_raw == 0 {
+                continue;
+            }
+
+            let cache = self.cache.borrow();
+            let order_info = cache.order(&client_order_id).and_then(|order| {
+                if order.is_closed() {
+                    None
+                } else {
+                    Some(order.order_side())
+                }
+            });
+            drop(cache);
+
+            let Some(side) = order_info else {
+                stale.push(client_order_id);
+                continue;
+            };
+
+            if side != order_side {
+                continue;
+            }
+
+            // Fraction of cancels statistically ahead of us: qty_ahead · (Δ/prev)^k.
+            // k>1 suppresses transient churn (small Δ/prev) but keeps genuine departures.
+            let frac = cancelled as f64 / prev as f64;
+            let k = gm_qtrace::queue_exponent();
+            let weighted = if k == 1.0 { frac } else { frac.powf(k) };
+            let reduction = (ahead_raw as f64 * weighted) as QuantityRaw;
+            let new_ahead = ahead_raw.saturating_sub(reduction);
+            self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, new_ahead, 2);
         }
 
         for id in stale {
@@ -1321,14 +1626,36 @@ impl OrderMatchingEngine {
             return Ok(());
         }
 
+        // GOLDMINE proportional queue model: sample the market depth AT this level BEFORE the
+        // book mutates, so `cap_queue_ahead_proportional` can compute the cancelled fraction.
+        if gm_qtrace::proportional_enabled()
+            && self.config.queue_position
+            && matches!(delta.action, BookAction::Update | BookAction::Delete)
+        {
+            self.qq_prev_size_for_delta = self
+                .book
+                .get_quantity_at_level(
+                    delta.order.price,
+                    OrderCore::opposite_side(delta.order.side),
+                    self.instrument.size_precision(),
+                )
+                .raw;
+        }
+
         self.book.apply_delta(delta)?;
 
         let delta_snapshot_or_clear = (delta.flags & 32) != 0 || delta.action == BookAction::Clear;
 
         if self.config.queue_position {
             if delta_snapshot_or_clear {
-                self.clear_all_queue_positions();
+                self.handle_snapshot_queue_reset();
             } else {
+                // GOLDMINE RE-DERIVE: a snapshot burst just ended — recompute queue from the
+                // now-complete book before applying this delta's incremental adjustment.
+                if self.queue_resnap_pending {
+                    self.resnapshot_all_queue_positions();
+                    self.queue_resnap_pending = false;
+                }
                 self.adjust_queue_for_delta(delta);
             }
         }
@@ -1339,6 +1666,59 @@ impl OrderMatchingEngine {
 
         self.iterate(delta.ts_init, AggressorSide::NoAggressor);
         Ok(())
+    }
+
+    /// GOLDMINE snapshot-reset policy (backtest-only), selected by env:
+    ///   * default            → `clear_all_queue_positions` (stock: zero every resting order).
+    ///   * MM_BT_SNAP_PRESERVE → carry `queue_ahead_total` through untouched (the fix; a recorder
+    ///                           snapshot is a data refresh, not a venue queue reset).
+    ///   * MM_BT_SNAP_REDERIVE → defer, then re-derive queue from the rebuilt book.
+    fn handle_snapshot_queue_reset(&mut self) {
+        if gm_qtrace::snapshot_preserve_enabled() {
+            // PRESERVE queue_ahead_total. For L3 books the per-order-id map cannot survive a book
+            // rebuild, so clear it (empty for L2_MBP); queue_ahead_total keeps the aggregate ahead.
+            for orders_ahead in self.queue_ahead_orders.values_mut() {
+                orders_ahead.clear();
+            }
+        } else if gm_qtrace::snapshot_rederive_enabled() {
+            self.queue_resnap_pending = true;
+        } else {
+            self.clear_all_queue_positions();
+        }
+    }
+
+    /// Re-derive every tracked order's `queue_ahead` from the current book (RE-DERIVE model).
+    fn resnapshot_all_queue_positions(&mut self) {
+        let size_prec = self.instrument.size_precision();
+        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
+        let mut stale: Vec<ClientOrderId> = Vec::new();
+        for coid in keys {
+            let price_raw = match self.queue_ahead_total.get(&coid) {
+                Some((p, _)) => *p,
+                None => continue,
+            };
+            let cache = self.cache.borrow();
+            let info = cache.order(&coid).and_then(|o| {
+                if o.is_closed() {
+                    None
+                } else {
+                    o.price().map(|p| (o.order_side(), p))
+                }
+            });
+            drop(cache);
+            let Some((side, price)) = info else {
+                stale.push(coid);
+                continue;
+            };
+            let qa =
+                self.book
+                    .get_quantity_at_level(price, OrderCore::opposite_side(side), size_prec);
+            self.queue_ahead_total.insert(coid, (price_raw, qa.raw));
+        }
+        for id in stale {
+            self.queue_ahead_total.shift_remove(&id);
+            self.queue_ahead_orders.shift_remove(&id);
+        }
     }
 
     /// Process the venues market for the given order book deltas.
@@ -1372,9 +1752,13 @@ impl OrderMatchingEngine {
         if self.config.queue_position {
             for delta in &deltas.deltas {
                 if (delta.flags & 32) != 0 || delta.action == BookAction::Clear {
-                    self.clear_all_queue_positions();
+                    self.handle_snapshot_queue_reset();
                     has_snapshot_or_clear = true;
                     break;
+                }
+                if self.queue_resnap_pending {
+                    self.resnapshot_all_queue_positions();
+                    self.queue_resnap_pending = false;
                 }
                 self.adjust_queue_for_delta(delta);
             }
@@ -2157,6 +2541,12 @@ impl OrderMatchingEngine {
             self.seed_trade_consumption(price_raw, trade.size.raw, trade.ts_event, aggressor_side);
         }
 
+        // GOLDMINE RE-DERIVE: if a snapshot burst just ended, re-derive queue from the rebuilt
+        // book before this trade consumes it.
+        if self.config.queue_position && self.queue_resnap_pending {
+            self.resnapshot_all_queue_positions();
+            self.queue_resnap_pending = false;
+        }
         self.resolve_pending_on_trade(price_raw);
         self.decrement_queue_on_trade(price_raw, trade.size.raw, aggressor_side);
 
@@ -4757,7 +5147,12 @@ impl OrderMatchingEngine {
                             }
                             return;
                         }
-                        Some(allowed) => Some(allowed),
+                        Some(allowed) => {
+                            // GOLDMINE qtrace: this maker fill is proceeding — attribute it to the
+                            // path that last cleared this order's queue.
+                            gm_qtrace::record_fill(client_order_id);
+                            Some(allowed)
+                        }
                     }
                 } else {
                     None
