@@ -13,18 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [Gate](https://www.gate.com) (gate.io) integration adapter for the NautilusTrader platform.
-//!
-//! Spot market data + execution over Gate's APIv4 REST + WebSocket. Signing, endpoints and message
-//! shapes are implemented first-hand against the CCXT reference (`ccxt/python/ccxt/gate.py` +
-//! `pro/gate.py`): HMAC-SHA512 request signing over `METHOD\npath\nquery\nSHA512(body)\ntimestamp`,
-//! `BTC_USDT` symbol format, `wss://api.gateio.ws/ws/v4/` spot depth + trade streams.
+//! Gate APIv4 WebSocket layer: spot order book + trade streams.
 
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-pub mod provider;
-pub mod websocket;
+pub mod client;
+pub mod messages;
+pub mod parse;
