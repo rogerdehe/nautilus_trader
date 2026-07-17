@@ -13,19 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [BingX](https://bingx.com) integration adapter for the NautilusTrader platform.
-//!
-//! Spot + USDT-M (linear) swap market data and execution over BingX's `open-api.bingx.com` REST
-//! and WebSocket APIs. Signing, endpoints and message shapes are implemented first-hand against
-//! the CCXT reference (`ccxt/python/ccxt/bingx.py` + `pro/bingx.py`):
-//! `HMAC_SHA256(secret, rawencode(keysort(params)))` request signing with `X-BX-APIKEY` header,
-//! `BASE-QUOTE` (hyphen, uppercase) symbol format, and gzip-compressed WebSocket depth + trade
-//! streams with an app-level `Ping`/`Pong` keepalive.
+//! BingX public WebSocket client, message models, and parsers.
 
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-pub mod websocket;
+pub mod client;
+pub mod messages;
+pub mod parse;
