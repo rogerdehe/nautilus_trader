@@ -6412,6 +6412,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-lbank"
+version = "0.61.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "aws-lc-rs",
+ "chrono",
+ "dashmap",
+ "dotenvy",
+ "futures-util",
+ "hex",
+ "log",
+ "md-5 0.10.6",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "ustr",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-lighter"
 version = "0.61.0"
 dependencies = [

@@ -16,6 +16,7 @@ members = [
   "crates/adapters/hyperliquid",
   "crates/adapters/interactive_brokers",
   "crates/adapters/kraken",
+  "crates/adapters/lbank",
   "crates/adapters/lighter",
   "crates/adapters/okx",
   "crates/adapters/polymarket",
@@ -111,6 +112,7 @@ nautilus-dydx = { path = "crates/adapters/dydx", version = "0.61.0", default-fea
 nautilus-hyperliquid = { path = "crates/adapters/hyperliquid", version = "0.61.0", default-features = false }
 nautilus-interactive-brokers = { path = "crates/adapters/interactive_brokers", version = "0.61.0" }
 nautilus-kraken = { path = "crates/adapters/kraken", version = "0.61.0", default-features = false }
+nautilus-lbank = { path = "crates/adapters/lbank", version = "0.61.0", default-features = false }
 nautilus-lighter = { path = "crates/adapters/lighter", version = "0.61.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.61.0", default-features = false }
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.61.0", default-features = false }
@@ -176,6 +178,7 @@ futures-util = { version = "0.3.32", default-features = false, features = [
   "async-await",
   "sink",
 ] }
+hex = "0.4.3"
 http = "1.4.2"
 implied-vol = { version = "2.0.0" }
 indexmap = { version = "2.14.0", features = ["serde"] }
@@ -187,6 +190,7 @@ log = { version = "0.4.33", features = [
   "release_max_level_debug",
 ] }
 madsim = "0.2.34"
+md-5 = "0.10.6"
 mimalloc = "0.1.52"
 object_store = { version = "0.13.2", default-features = false, features = [
   "fs",
