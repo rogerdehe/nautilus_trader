@@ -532,6 +532,19 @@ The factory returns `Box<dyn DataClient>` or `Box<dyn ExecutionClient>`. An exec
 receives a read-only `CacheView`; pass that view to `ExecutionClientCore` rather than mutating the
 platform cache from the adapter.
 
+#### Instrument request freshness
+
+`DataClient::request_instrument` and `DataClient::request_instruments` are point-in-time venue
+requests. Fetch from the upstream API on every call, even when the requested definitions already
+exist in an adapter or platform cache. Update caches from a successful response, but do not use a
+cached definition as the response to a new request. If the venue cannot fetch definitions on demand,
+return an explicit unsupported error instead of silently serving cached data.
+
+Keep requests separate from subscriptions. Instrument subscriptions deliver future definition
+updates; replaying a cached definition does not prove that an adapter supports live instrument
+updates. Test request freshness by changing the mock upstream response between two calls and
+asserting that the second response reflects the changed source.
+
 The PyO3 module registers factory and config extractors with `get_global_pyo3_registry()` so
 `LiveNode.builder().add_data_client(...)` and `.add_exec_client(...)` can pass Python objects into
 the Rust factory traits. Register the public config and factory classes in the adapter's
@@ -2200,28 +2213,28 @@ proves the same core behaviours.
 
 ##### HTTP client integration coverage
 
-- **Happy paths** – fetch a representative public resource (e.g., instruments or mark price) and verify the
+- **Happy paths** - fetch a representative public resource (e.g., instruments or mark price) and verify the
   response is converted into Nautilus domain models.
-- **Credential guard** – call a private endpoint without credentials and assert a structured error; repeat with
+- **Credential guard** - call a private endpoint without credentials and assert a structured error; repeat with
   credentials to prove success.
-- **Rate limiting / retry mapping** – surface venue-specific rate-limit responses and assert the adapter produces
+- **Rate limiting / retry mapping** - surface venue-specific rate-limit responses and assert the adapter produces
   the correct `OkxError`/`BitmexHttpError` variant so the retry policy can react.
-- **Query builders** – exercise builders for paginated/time-bounded endpoints (historical trades, candles) and
+- **Query builders** - exercise builders for paginated/time-bounded endpoints (historical trades, candles) and
   assert the emitted query string matches the venue specification (`after`, `before`, `limit`, etc.).
-- **Error translation** – verify non-2xx upstream responses map to adapter error enums with the original code/message attached.
+- **Error translation** - verify non-2xx upstream responses map to adapter error enums with the original code/message attached.
 
 ##### WebSocket client integration coverage
 
-- **Login handshake** – confirm a successful login flips the internal auth state and test failure cases where the
+- **Login handshake** - confirm a successful login flips the internal auth state and test failure cases where the
   server returns a non-zero code; the client should surface an error and avoid marking itself as authenticated.
-- **Ping/Pong** – prove both text-based and control-frame pings trigger immediate pong responses.
-- **Subscription lifecycle** – assert subscription requests/acks are emitted for public and private channels, and that
+- **Ping/Pong** - prove both text-based and control-frame pings trigger immediate pong responses.
+- **Subscription lifecycle** - assert subscription requests/acks are emitted for public and private channels, and that
   unsubscribe calls remove entries from the cached subscription sets.
-- **Reconnect behaviour** – simulate a disconnect and verify the client re-authenticates, restores public channels,
+- **Reconnect behaviour** - simulate a disconnect and verify the client re-authenticates, restores public channels,
   and skips private channels that were explicitly unsubscribed pre-disconnect.
-- **Message routing** – feed representative data/ack/error payloads through the socket and assert they arrive on the
+- **Message routing** - feed representative data/ack/error payloads through the socket and assert they arrive on the
   public stream as the correct `{Venue}WsMessage` variant.
-- **Quota tagging** – (optional but recommended) validate that order/cancel/amend operations are tagged with the
+- **Quota tagging** - (optional but recommended) validate that order/cancel/amend operations are tagged with the
   appropriate quota label so rate limiting can be enforced independently of subscription traffic.
 
 **CI robustness:**

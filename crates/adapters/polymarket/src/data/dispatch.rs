@@ -542,7 +542,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
 
                     loop {
                         let params = GetGammaMarketsParams {
-                            condition_ids: Some(condition_id.clone()),
+                            condition_ids: Some(vec![condition_id.clone()]),
                             ..Default::default()
                         };
                         let fetch =
@@ -563,6 +563,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                                 }
 
                                 let transient_hit = transient.iter().any(|cid| cid == &condition_id);
+
                                 if attempt < NEW_MARKET_EMPTY_RECHECK_MAX_ATTEMPTS {
                                     attempt += 1;
                                     let reason = if transient_hit {
@@ -787,11 +788,11 @@ mod tests {
             upsert_resolve_watch_entry_from_instrument,
         },
         websocket::{
-            client::PolymarketWebSocketClient,
             messages::{
                 PolymarketBookLevel, PolymarketBookSnapshot, PolymarketMarketResolved,
                 PolymarketQuote, PolymarketTickSizeChange,
             },
+            pool::PolymarketMarketConnectionPool,
         },
     };
 
@@ -2022,10 +2023,11 @@ mod tests {
             PolymarketClobPublicClient::new(Some(base_url.clone()), 5).expect("clob client");
         let data_api =
             PolymarketDataApiHttpClient::new(Some(base_url.clone()), 5).expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some(format!("ws://{addr}/ws/market")),
             false,
             TransportBackend::default(),
+            crate::common::consts::WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         let config = PolymarketDataClientConfig {
@@ -2063,10 +2065,11 @@ mod tests {
             .expect("clob client");
         let data_api = PolymarketDataApiHttpClient::new(Some("http://localhost".to_string()), 5)
             .expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some("ws://localhost/ws/market".to_string()),
             false,
             TransportBackend::default(),
+            crate::common::consts::WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         PolymarketDataClient::new(
@@ -3346,6 +3349,9 @@ mod tests {
             .cloned()
             .expect("rebuilt instrument");
         assert_eq!(rebuilt.price_increment(), Price::from("0.001"));
+        // Rebuild derives tick-relative bounds for the new 0.001 tick
+        assert_eq!(rebuilt.min_price(), Some(Price::from("0.001")));
+        assert_eq!(rebuilt.max_price(), Some(Price::from("0.999")));
 
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
         assert!(

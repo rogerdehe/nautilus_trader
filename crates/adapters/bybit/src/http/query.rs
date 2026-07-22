@@ -896,7 +896,7 @@ pub struct BybitApiKeyPermissionUpdate {
     // rule would otherwise emit `"Nft"` and the venue would ignore the field.
     #[serde(rename = "NFT", skip_serializing_if = "Option::is_none")]
     pub nft: Option<Vec<String>>,
-    // Bybit uses `"FiatP2P"` — PascalCase rename would emit `"FiatP2p"`.
+    // Bybit uses `"FiatP2P"` - PascalCase rename would emit `"FiatP2p"`.
     #[serde(rename = "FiatP2P", skip_serializing_if = "Option::is_none")]
     pub fiat_p2p: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -907,7 +907,7 @@ pub struct BybitApiKeyPermissionUpdate {
     pub fiat_convert_broker: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bit_card: Option<Vec<String>>,
-    // Bybit uses `"ByXPost"` — PascalCase rename would emit `"ByxPost"`.
+    // Bybit uses `"ByXPost"` - PascalCase rename would emit `"ByxPost"`.
     #[serde(rename = "ByXPost", skip_serializing_if = "Option::is_none")]
     pub byx_post: Option<Vec<String>>,
 }

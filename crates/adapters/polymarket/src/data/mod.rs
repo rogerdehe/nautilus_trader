@@ -41,9 +41,10 @@ use nautilus_common::{
         DataEvent,
         data::{
             RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBookDeltas, SubscribeCustomData, SubscribeInstruments,
-            SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeCustomData,
-            UnsubscribeQuotes, UnsubscribeTrades,
+            RequestTrades, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData,
+            SubscribeInstrument, SubscribeInstrumentClose, SubscribeInstrumentStatus,
+            SubscribeInstruments, SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas,
+            UnsubscribeCustomData, UnsubscribeInstrument, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     msgbus::TypedHandler,
@@ -84,7 +85,7 @@ use crate::{
     providers::PolymarketInstrumentProvider,
     resolve::ResolveWatchEntry,
     rtds::{PolymarketRtdsFeed, is_supported_rtds_data_type},
-    websocket::client::PolymarketWebSocketClient,
+    websocket::pool::PolymarketMarketConnectionPool,
 };
 
 const NEW_MARKET_FETCH_MAX_CONCURRENCY_CAP: usize = 64;
@@ -110,7 +111,7 @@ pub struct PolymarketDataClient {
     provider: PolymarketInstrumentProvider,
     clob_public_client: PolymarketClobPublicClient,
     data_api_client: PolymarketDataApiHttpClient,
-    ws_client: PolymarketWebSocketClient,
+    ws_client: PolymarketMarketConnectionPool,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
@@ -143,7 +144,7 @@ impl PolymarketDataClient {
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
-        ws_client: PolymarketWebSocketClient,
+        ws_client: PolymarketMarketConnectionPool,
     ) -> Self {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
@@ -290,7 +291,7 @@ impl PolymarketDataClient {
         let active_trade_subs = self.active_trade_subs.clone();
         let ws_open_tokens = self.ws_open_tokens.clone();
         let ws_sub_mutex = self.ws_sub_mutex.clone();
-        let ws = self.ws_client.clone_subscription_handle();
+        let ws = self.ws_client.handle();
 
         get_runtime().spawn(sync_ws_subscription_async(
             instrument_id,
@@ -378,6 +379,23 @@ impl DataClient for PolymarketDataClient {
         Ok(())
     }
 
+    fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Subscribed to instrument definition updates for {}; shared instrument sources remain active",
+            cmd.instrument_id
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribed from instrument {}; shared instrument sources remain active",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
         if !is_supported_rtds_data_type(&cmd.data_type) {
             log::debug!(
@@ -439,6 +457,12 @@ impl DataClient for PolymarketDataClient {
         Ok(())
     }
 
+    fn subscribe_book_depth10(&mut self, _cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support OrderBookDepth10 subscriptions; use managed L2_MBP order book deltas"
+        )
+    }
+
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         self.ensure_live_subscription_allowed(instrument_id)?;
@@ -481,6 +505,21 @@ impl DataClient for PolymarketDataClient {
 
         self.sync_ws_subscription(instrument_id);
         Ok(())
+    }
+
+    fn subscribe_instrument_status(
+        &mut self,
+        _cmd: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support generic instrument status subscriptions; resolution status is owned by position tracking"
+        )
+    }
+
+    fn subscribe_instrument_close(&mut self, _cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support generic instrument close subscriptions; resolution close is owned by position tracking"
+        )
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {

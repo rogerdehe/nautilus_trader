@@ -23,17 +23,20 @@ use std::str::FromStr;
 use anyhow::Context;
 use nautilus_core::nanos::UnixNanos;
 use nautilus_model::{
-    data::{Bar, BarSpecification, BarType, TradeTick},
+    data::{
+        Bar, BarSpecification, BarType, BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick,
+        TradeTick,
+    },
     enums::{
-        AggressorSide, BarAggregation, LiquiditySide, OrderSide, OrderStatus, OrderType,
-        TimeInForce, TriggerType,
+        AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide, OrderStatus,
+        OrderType, RecordFlag, TimeInForce, TriggerType,
     },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, Symbol, TradeId, Venue, VenueOrderId,
     },
     instruments::{
-        Instrument, any::InstrumentAny, crypto_perpetual::CryptoPerpetual,
-        currency_pair::CurrencyPair,
+        Instrument, any::InstrumentAny, crypto_future::CryptoFuture,
+        crypto_perpetual::CryptoPerpetual, currency_pair::CurrencyPair,
     },
     reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price, Quantity},
@@ -45,7 +48,10 @@ use crate::{
     common::{
         consts::BINANCE,
         encoder::decode_broker_id,
-        enums::{BinanceContractStatus, BinanceKlineInterval, BinanceTradingStatus},
+        enums::{
+            BinanceContractStatus, BinanceKlineInterval, BinanceProductType, BinanceTradingStatus,
+        },
+        symbol::format_instrument_id,
     },
     futures::http::models::{BinanceFuturesCoinSymbol, BinanceFuturesUsdSymbol},
     spot::{
@@ -60,6 +66,10 @@ use crate::{
     },
 };
 const CONTRACT_TYPE_PERPETUAL: &str = "PERPETUAL";
+const CONTRACT_TYPE_CURRENT_MONTH: &str = "CURRENT_MONTH";
+const CONTRACT_TYPE_NEXT_MONTH: &str = "NEXT_MONTH";
+const CONTRACT_TYPE_CURRENT_QUARTER: &str = "CURRENT_QUARTER";
+const CONTRACT_TYPE_NEXT_QUARTER: &str = "NEXT_QUARTER";
 
 /// Returns a currency from the internal map or creates a new crypto currency.
 pub fn get_currency(code: &str) -> Currency {
@@ -179,26 +189,33 @@ pub(crate) fn price_at_precision(price: Price, precision: u8) -> Option<Price> {
     Price::from_decimal_dp(price.as_decimal(), precision).ok()
 }
 
-/// Parses a USD-M Futures symbol definition into a Nautilus CryptoPerpetual instrument.
+/// Parses a USD-M Futures symbol definition into a Nautilus crypto futures instrument.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Required filter values are missing (PRICE_FILTER, LOT_SIZE).
 /// - Price or quantity values cannot be parsed.
-/// - The contract type is not PERPETUAL.
+/// - The contract type is not a supported perpetual or delivery contract.
 pub fn parse_usdm_instrument(
     symbol: &BinanceFuturesUsdSymbol,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    // Only handle perpetual contracts for now
-    if symbol.contract_type != CONTRACT_TYPE_PERPETUAL {
+    let is_perpetual = symbol.contract_type == CONTRACT_TYPE_PERPETUAL;
+    let is_delivery = matches!(
+        symbol.contract_type.as_str(),
+        CONTRACT_TYPE_CURRENT_MONTH
+            | CONTRACT_TYPE_NEXT_MONTH
+            | CONTRACT_TYPE_CURRENT_QUARTER
+            | CONTRACT_TYPE_NEXT_QUARTER
+    );
+
+    if !is_perpetual && !is_delivery {
         anyhow::bail!(
-            "Unsupported contract type '{}' for symbol '{}', expected '{}'",
+            "Unsupported USD-M contract type '{}' for symbol '{}'",
             symbol.contract_type,
             symbol.symbol,
-            CONTRACT_TYPE_PERPETUAL
         );
     }
 
@@ -214,10 +231,7 @@ pub fn parse_usdm_instrument(
     let quote_currency = get_currency(symbol.quote_asset.as_str());
     let settlement_currency = get_currency(symbol.margin_asset.as_str());
 
-    let instrument_id = InstrumentId::new(
-        Symbol::from_str_unchecked(format!("{}-PERP", symbol.symbol)),
-        Venue::new(BINANCE),
-    );
+    let instrument_id = format_instrument_id(&symbol.symbol, BinanceProductType::UsdM);
     let raw_symbol = Symbol::new(symbol.symbol.as_str());
 
     let price_filter = get_filter(&symbol.filters, "PRICE_FILTER")
@@ -245,39 +259,74 @@ pub fn parse_usdm_instrument(
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
-    let instrument = CryptoPerpetual::new(
-        instrument_id,
-        raw_symbol,
-        base_currency,
-        quote_currency,
-        settlement_currency,
-        false, // is_inverse
-        tick_size.precision,
-        step_size.precision,
-        tick_size,
-        step_size,
-        None, // multiplier
-        Some(step_size),
-        max_quantity,
-        min_quantity,
-        None, // max_notional
-        min_notional,
-        max_price,
-        min_price,
-        Some(default_margin),
-        Some(default_margin),
-        None, // maker_fee
-        None, // taker_fee
-        None, // tick_scheme
-        None, // info
-        ts_event,
-        ts_init,
-    );
-
-    Ok(InstrumentAny::CryptoPerpetual(instrument))
+    if is_perpetual {
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            raw_symbol,
+            base_currency,
+            quote_currency,
+            settlement_currency,
+            false,
+            tick_size.precision,
+            step_size.precision,
+            tick_size,
+            step_size,
+            None,
+            Some(step_size),
+            max_quantity,
+            min_quantity,
+            None,
+            min_notional,
+            max_price,
+            min_price,
+            Some(default_margin),
+            Some(default_margin),
+            None,
+            None,
+            None,
+            None,
+            ts_event,
+            ts_init,
+        );
+        Ok(InstrumentAny::CryptoPerpetual(instrument))
+    } else {
+        let activation_ns = parse_futures_timestamp(symbol.onboard_date, "onboardDate")?;
+        let expiration_ns = parse_futures_timestamp(symbol.delivery_date, "deliveryDate")?;
+        let instrument = CryptoFuture::new(
+            instrument_id,
+            raw_symbol,
+            base_currency,
+            quote_currency,
+            settlement_currency,
+            false,
+            activation_ns,
+            expiration_ns,
+            tick_size.precision,
+            step_size.precision,
+            tick_size,
+            step_size,
+            None,
+            Some(step_size),
+            max_quantity,
+            min_quantity,
+            None,
+            min_notional,
+            max_price,
+            min_price,
+            Some(default_margin),
+            Some(default_margin),
+            None,
+            None,
+            None,
+            None,
+            ts_event,
+            ts_init,
+        );
+        Ok(InstrumentAny::CryptoFuture(instrument))
+    }
 }
 
-/// Parses a COIN-M Futures symbol definition into a Nautilus CryptoPerpetual instrument.
+/// Parses a COIN-M Futures symbol definition into a Nautilus crypto futures instrument.
 ///
 /// COIN-M perpetuals are inverse contracts settled in base currency (e.g., BTC).
 ///
@@ -286,19 +335,24 @@ pub fn parse_usdm_instrument(
 /// Returns an error if:
 /// - Required filter values are missing (PRICE_FILTER, LOT_SIZE).
 /// - Price or quantity values cannot be parsed.
-/// - The contract type is not PERPETUAL.
+/// - The contract type is not a supported perpetual or quarterly delivery contract.
 /// - The contract is not in TRADING status.
 pub fn parse_coinm_instrument(
     symbol: &BinanceFuturesCoinSymbol,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    if symbol.contract_type != CONTRACT_TYPE_PERPETUAL {
+    let is_perpetual = symbol.contract_type == CONTRACT_TYPE_PERPETUAL;
+    let is_delivery = matches!(
+        symbol.contract_type.as_str(),
+        CONTRACT_TYPE_CURRENT_QUARTER | CONTRACT_TYPE_NEXT_QUARTER
+    );
+
+    if !is_perpetual && !is_delivery {
         anyhow::bail!(
-            "Unsupported contract type '{}' for symbol '{}', expected '{}'",
+            "Unsupported COIN-M contract type '{}' for symbol '{}'",
             symbol.contract_type,
             symbol.symbol,
-            CONTRACT_TYPE_PERPETUAL
         );
     }
 
@@ -316,10 +370,7 @@ pub fn parse_coinm_instrument(
     // COIN-M contracts are settled in the base currency (inverse)
     let settlement_currency = get_currency(symbol.margin_asset.as_str());
 
-    let instrument_id = InstrumentId::new(
-        Symbol::from_str_unchecked(format!("{}-PERP", symbol.symbol)),
-        Venue::new(BINANCE),
-    );
+    let instrument_id = format_instrument_id(&symbol.symbol, BinanceProductType::CoinM);
     let raw_symbol = Symbol::new(symbol.symbol.as_str());
 
     let price_filter = get_filter(&symbol.filters, "PRICE_FILTER")
@@ -343,43 +394,87 @@ pub fn parse_coinm_instrument(
     let min_quantity = parse_filter_quantity(lot_filter, "minQty").ok();
 
     // COIN-M has contract_size as the multiplier
-    let multiplier = Quantity::new(symbol.contract_size as f64, 0);
+    let multiplier = Quantity::from(symbol.contract_size);
 
     let min_notional = parse_futures_min_notional(&symbol.filters, quote_currency);
 
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
-    let instrument = CryptoPerpetual::new(
-        instrument_id,
-        raw_symbol,
-        base_currency,
-        quote_currency,
-        settlement_currency,
-        true, // is_inverse (COIN-M contracts are inverse)
-        tick_size.precision,
-        step_size.precision,
-        tick_size,
-        step_size,
-        Some(multiplier),
-        Some(step_size),
-        max_quantity,
-        min_quantity,
-        None, // max_notional
-        min_notional,
-        max_price,
-        min_price,
-        Some(default_margin),
-        Some(default_margin),
-        None, // maker_fee
-        None, // taker_fee
-        None, // tick_scheme
-        None, // info
-        ts_event,
-        ts_init,
-    );
+    if is_perpetual {
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            raw_symbol,
+            base_currency,
+            quote_currency,
+            settlement_currency,
+            true,
+            tick_size.precision,
+            step_size.precision,
+            tick_size,
+            step_size,
+            Some(multiplier),
+            Some(step_size),
+            max_quantity,
+            min_quantity,
+            None,
+            min_notional,
+            max_price,
+            min_price,
+            Some(default_margin),
+            Some(default_margin),
+            None,
+            None,
+            None,
+            None,
+            ts_event,
+            ts_init,
+        );
+        Ok(InstrumentAny::CryptoPerpetual(instrument))
+    } else {
+        let activation_ns = parse_futures_timestamp(symbol.onboard_date, "onboardDate")?;
+        let expiration_ns = parse_futures_timestamp(symbol.delivery_date, "deliveryDate")?;
+        let instrument = CryptoFuture::new(
+            instrument_id,
+            raw_symbol,
+            base_currency,
+            quote_currency,
+            settlement_currency,
+            true,
+            activation_ns,
+            expiration_ns,
+            tick_size.precision,
+            step_size.precision,
+            tick_size,
+            step_size,
+            Some(multiplier),
+            Some(step_size),
+            max_quantity,
+            min_quantity,
+            None,
+            min_notional,
+            max_price,
+            min_price,
+            Some(default_margin),
+            Some(default_margin),
+            None,
+            None,
+            None,
+            None,
+            ts_event,
+            ts_init,
+        );
+        Ok(InstrumentAny::CryptoFuture(instrument))
+    }
+}
 
-    Ok(InstrumentAny::CryptoPerpetual(instrument))
+fn parse_futures_timestamp(value: i64, field: &str) -> anyhow::Result<UnixNanos> {
+    let millis = u64::try_from(value)
+        .with_context(|| format!("Invalid Binance Futures {field} timestamp '{value}'"))?;
+    let nanos = millis
+        .checked_mul(1_000_000)
+        .context("Binance Futures timestamp overflowed nanoseconds")?;
+    Ok(UnixNanos::from(nanos))
 }
 
 /// SBE status value for Trading.
@@ -1020,12 +1115,12 @@ pub fn parse_fill_report_sbe(
 /// # Errors
 ///
 /// Returns an error if any kline cannot be parsed.
-pub fn parse_klines_to_bars(
+pub fn parse_klines_to_binance_bars(
     klines: &BinanceKlines,
     bar_type: BarType,
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
-) -> anyhow::Result<Vec<Bar>> {
+) -> anyhow::Result<Vec<crate::common::bar::BinanceBar>> {
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
@@ -1049,13 +1144,60 @@ pub fn parse_klines_to_bars(
             Decimal::from_i128_with_scale(volume_mantissa, (-klines.qty_exponent as i32) as u32);
         let volume = Quantity::from_decimal_dp(volume_dec, size_precision)?;
 
-        let ts_event = UnixNanos::from_micros(kline.open_time as u64);
+        let quote_volume = Decimal::from_i128_with_scale(
+            i128::from_le_bytes(kline.quote_volume),
+            (-klines.price_exponent as i32) as u32,
+        );
+        let taker_buy_base_volume = Decimal::from_i128_with_scale(
+            i128::from_le_bytes(kline.taker_buy_base_volume),
+            (-klines.qty_exponent as i32) as u32,
+        );
+        let taker_buy_quote_volume = Decimal::from_i128_with_scale(
+            i128::from_le_bytes(kline.taker_buy_quote_volume),
+            (-klines.price_exponent as i32) as u32,
+        );
+        let count = u64::try_from(kline.num_trades).map_err(|_| {
+            anyhow::anyhow!("invalid negative kline trade count {}", kline.num_trades)
+        })?;
+        let ts_event = UnixNanos::from_micros(kline.close_time as u64);
 
-        let bar = Bar::new(bar_type, open, high, low, close, volume, ts_event, ts_init);
+        let bar = crate::common::bar::BinanceBar::new(
+            bar_type,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            quote_volume,
+            count,
+            taker_buy_base_volume,
+            taker_buy_quote_volume,
+            ts_event,
+            ts_init,
+        );
         bars.push(bar);
     }
 
     Ok(bars)
+}
+
+/// Parses Binance SBE klines into core bars.
+///
+/// # Errors
+///
+/// Returns an error if any kline cannot be parsed.
+pub fn parse_klines_to_bars(
+    klines: &BinanceKlines,
+    bar_type: BarType,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<Bar>> {
+    Ok(
+        parse_klines_to_binance_bars(klines, bar_type, instrument, ts_init)?
+            .into_iter()
+            .map(|bar| bar.bar())
+            .collect(),
+    )
 }
 
 /// Converts a Nautilus bar specification to a Binance kline interval.
@@ -1069,9 +1211,10 @@ pub fn bar_spec_to_binance_interval(
 ) -> anyhow::Result<BinanceKlineInterval> {
     let step = bar_spec.step.get();
     let interval = match bar_spec.aggregation {
-        BarAggregation::Second => {
-            anyhow::bail!("Binance Spot does not support second-level kline intervals")
-        }
+        BarAggregation::Second => match step {
+            1 => BinanceKlineInterval::Second1,
+            _ => anyhow::bail!("Unsupported second interval: {step}s"),
+        },
         BarAggregation::Minute => match step {
             1 => BinanceKlineInterval::Minute1,
             3 => BinanceKlineInterval::Minute3,
@@ -1108,6 +1251,39 @@ pub fn bar_spec_to_binance_interval(
     Ok(interval)
 }
 
+pub(crate) fn quote_to_l1_deltas(quote: QuoteTick, sequence: u64) -> OrderBookDeltas {
+    let bid_action = if quote.bid_size.is_zero() {
+        BookAction::Delete
+    } else {
+        BookAction::Update
+    };
+    let ask_action = if quote.ask_size.is_zero() {
+        BookAction::Delete
+    } else {
+        BookAction::Update
+    };
+    let bid = OrderBookDelta::new(
+        quote.instrument_id,
+        bid_action,
+        BookOrder::new(OrderSide::Buy, quote.bid_price, quote.bid_size, 0),
+        RecordFlag::F_MBP as u8,
+        sequence,
+        quote.ts_event,
+        quote.ts_init,
+    );
+    let ask = OrderBookDelta::new(
+        quote.instrument_id,
+        ask_action,
+        BookOrder::new(OrderSide::Sell, quote.ask_price, quote.ask_size, 0),
+        RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
+        sequence,
+        quote.ts_event,
+        quote.ts_init,
+    );
+
+    OrderBookDeltas::new(quote.instrument_id, vec![bid, ask])
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1120,6 +1296,78 @@ mod tests {
         consts::BINANCE_NAUTILUS_SPOT_BROKER_ID,
         enums::{BinanceContractStatus, BinanceTradingStatus},
     };
+
+    #[rstest]
+    fn test_quote_to_l1_deltas_maps_all_fields() {
+        let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_001u64);
+        let ts_init = UnixNanos::from(1_700_000_000_000_000_002u64);
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("42000.01"),
+            Price::from("42000.02"),
+            Quantity::from("1.23456"),
+            Quantity::from("2.34567"),
+            ts_event,
+            ts_init,
+        );
+        let expected = OrderBookDeltas::new(
+            instrument_id,
+            vec![
+                OrderBookDelta::new(
+                    instrument_id,
+                    BookAction::Update,
+                    BookOrder::new(
+                        OrderSide::Buy,
+                        Price::from("42000.01"),
+                        Quantity::from("1.23456"),
+                        0,
+                    ),
+                    RecordFlag::F_MBP as u8,
+                    12345,
+                    ts_event,
+                    ts_init,
+                ),
+                OrderBookDelta::new(
+                    instrument_id,
+                    BookAction::Update,
+                    BookOrder::new(
+                        OrderSide::Sell,
+                        Price::from("42000.02"),
+                        Quantity::from("2.34567"),
+                        0,
+                    ),
+                    RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
+                    12345,
+                    ts_event,
+                    ts_init,
+                ),
+            ],
+        );
+
+        let actual = quote_to_l1_deltas(quote, 12345);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    fn test_quote_to_l1_deltas_deletes_empty_sides() {
+        let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("42000.01"),
+            Price::from("42000.02"),
+            Quantity::from("0.00000"),
+            Quantity::from("0.00000"),
+            UnixNanos::from(1_700_000_000_000_000_001u64),
+            UnixNanos::from(1_700_000_000_000_000_002u64),
+        );
+
+        let actual = quote_to_l1_deltas(quote, 12345);
+
+        assert_eq!(actual.deltas[0].action, BookAction::Delete);
+        assert_eq!(actual.deltas[1].action, BookAction::Delete);
+    }
 
     #[rstest]
     #[case::positive("0.001", 8, Some(Quantity::from_decimal_dp(Decimal::from_str("0.001").unwrap(), 8).unwrap()))]
@@ -1331,18 +1579,68 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_non_perpetual_fails() {
+    #[case::current_month(CONTRACT_TYPE_CURRENT_MONTH)]
+    #[case::next_month(CONTRACT_TYPE_NEXT_MONTH)]
+    #[case::current_quarter(CONTRACT_TYPE_CURRENT_QUARTER)]
+    #[case::next_quarter(CONTRACT_TYPE_NEXT_QUARTER)]
+    fn test_parse_usdm_delivery(#[case] contract_type: &str) {
         let mut symbol = sample_usdm_symbol();
-        symbol.contract_type = "CURRENT_QUARTER".to_string();
+        symbol.symbol = Ustr::from("BTCUSDT_260925");
+        symbol.contract_type = contract_type.to_string();
+        symbol.onboard_date = 1_774_598_400_000;
+        symbol.delivery_date = 1_790_323_200_000;
         let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
 
-        let result = parse_usdm_instrument(&symbol, ts, ts);
-        assert!(result.is_err());
+        let result = parse_usdm_instrument(&symbol, ts, ts).unwrap();
+        let InstrumentAny::CryptoFuture(future) = result else {
+            panic!("Expected CryptoFuture, was {result:?}");
+        };
+
+        assert_eq!(future.id.to_string(), "BTCUSDT_260925.BINANCE");
+        assert_eq!(future.raw_symbol.to_string(), "BTCUSDT_260925");
+        assert_eq!(future.underlying.code.as_str(), "BTC");
+        assert_eq!(future.quote_currency.code.as_str(), "USDT");
+        assert_eq!(future.settlement_currency.code.as_str(), "USDT");
+        assert!(!future.is_inverse);
+        assert_eq!(
+            future.activation_ns,
+            UnixNanos::from_millis(1_774_598_400_000)
+        );
+        assert_eq!(
+            future.expiration_ns,
+            UnixNanos::from_millis(1_790_323_200_000)
+        );
+        assert_eq!(future.price_increment, Price::from_str("0.10").unwrap());
+        assert_eq!(future.size_increment, Quantity::from_str("0.001").unwrap());
+        assert_eq!(future.multiplier, Quantity::from(1));
+        assert_eq!(
+            future.max_quantity,
+            Some(Quantity::from_str("1000").unwrap())
+        );
+        assert_eq!(
+            future.min_quantity,
+            Some(Quantity::from_str("0.001").unwrap())
+        );
+        assert_eq!(
+            future.min_notional,
+            Some(Money::new(5.0, future.quote_currency)),
+        );
+        assert_eq!(future.max_price, Some(Price::from_str("4529764").unwrap()));
+        assert_eq!(future.min_price, Some(Price::from_str("556.80").unwrap()));
+    }
+
+    #[rstest]
+    fn test_parse_usdm_unsupported_contract_type_fails() {
+        let mut symbol = sample_usdm_symbol();
+        symbol.contract_type = "TRADIFI_PERPETUAL".to_string();
+        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+        let error = parse_usdm_instrument(&symbol, ts, ts).unwrap_err();
+
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
-                .contains("Unsupported contract type")
+                .contains("Unsupported USD-M contract type")
         );
     }
 
@@ -1376,7 +1674,7 @@ mod tests {
 
         match result {
             InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.id.to_string(), "BTCUSD_PERP-PERP.BINANCE");
+                assert_eq!(perp.id.to_string(), "BTCUSD_PERP.BINANCE");
                 assert_eq!(perp.raw_symbol.to_string(), "BTCUSD_PERP");
                 assert_eq!(perp.base_currency.code.as_str(), "BTC");
                 assert_eq!(perp.quote_currency.code.as_str(), "USD");
@@ -1391,6 +1689,63 @@ mod tests {
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::current_quarter(CONTRACT_TYPE_CURRENT_QUARTER)]
+    #[case::next_quarter(CONTRACT_TYPE_NEXT_QUARTER)]
+    fn test_parse_coinm_delivery(#[case] contract_type: &str) {
+        let mut symbol = sample_coinm_symbol();
+        symbol.symbol = Ustr::from("BTCUSD_260925");
+        symbol.contract_type = contract_type.to_string();
+        symbol.onboard_date = 1_774_598_400_000;
+        symbol.delivery_date = 1_790_323_200_000;
+        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+        let result = parse_coinm_instrument(&symbol, ts, ts).unwrap();
+        let InstrumentAny::CryptoFuture(future) = result else {
+            panic!("Expected CryptoFuture, was {result:?}");
+        };
+
+        assert_eq!(future.id.to_string(), "BTCUSD_260925.BINANCE");
+        assert_eq!(future.raw_symbol.to_string(), "BTCUSD_260925");
+        assert_eq!(future.underlying.code.as_str(), "BTC");
+        assert_eq!(future.quote_currency.code.as_str(), "USD");
+        assert_eq!(future.settlement_currency.code.as_str(), "BTC");
+        assert!(future.is_inverse);
+        assert_eq!(
+            future.activation_ns,
+            UnixNanos::from_millis(1_774_598_400_000)
+        );
+        assert_eq!(
+            future.expiration_ns,
+            UnixNanos::from_millis(1_790_323_200_000)
+        );
+        assert_eq!(future.price_increment, Price::from_str("0.10").unwrap());
+        assert_eq!(future.size_increment, Quantity::from_str("1").unwrap());
+        assert_eq!(future.multiplier, Quantity::from(100));
+        assert_eq!(
+            future.max_quantity,
+            Some(Quantity::from_str("1000").unwrap())
+        );
+        assert_eq!(future.min_quantity, Some(Quantity::from_str("1").unwrap()));
+        assert_eq!(future.max_price, Some(Price::from_str("1000000").unwrap()));
+        assert_eq!(future.min_price, Some(Price::from_str("0.10").unwrap()));
+    }
+
+    #[rstest]
+    fn test_parse_coinm_month_contract_fails() {
+        let mut symbol = sample_coinm_symbol();
+        symbol.contract_type = CONTRACT_TYPE_CURRENT_MONTH.to_string();
+        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+        let error = parse_coinm_instrument(&symbol, ts, ts).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported COIN-M contract type")
+        );
     }
 
     #[rstest]
@@ -1660,15 +2015,15 @@ mod tests {
                 close_price: 12_345,
                 volume: 1_234_500_i128.to_le_bytes(),
                 close_time: 1_700_000_059_999_000,
-                quote_volume: 0_i128.to_le_bytes(),
+                quote_volume: 777_788_i128.to_le_bytes(),
                 num_trades: 100,
-                taker_buy_base_volume: 0_i128.to_le_bytes(),
-                taker_buy_quote_volume: 0_i128.to_le_bytes(),
+                taker_buy_base_volume: 56_789_i128.to_le_bytes(),
+                taker_buy_quote_volume: 9_901_i128.to_le_bytes(),
             }],
         };
         let ts_init = UnixNanos::from(1_700_000_001_000_000_000u64);
 
-        let bars = parse_klines_to_bars(&klines, bar_type, &instrument, ts_init).unwrap();
+        let bars = parse_klines_to_binance_bars(&klines, bar_type, &instrument, ts_init).unwrap();
 
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].bar_type, bar_type);
@@ -1677,9 +2032,13 @@ mod tests {
         assert_eq!(bars[0].low, Price::new(119.0, 2));
         assert_eq!(bars[0].close, Price::new(123.45, 2));
         assert_eq!(bars[0].volume, Quantity::new(123.45, 4));
+        assert_eq!(bars[0].quote_volume, dec!(7777.88));
+        assert_eq!(bars[0].count, 100);
+        assert_eq!(bars[0].taker_buy_base_volume, dec!(5.6789));
+        assert_eq!(bars[0].taker_buy_quote_volume, dec!(99.01));
         assert_eq!(
             bars[0].ts_event,
-            UnixNanos::from(1_700_000_000_000_000_000u64)
+            UnixNanos::from(1_700_000_059_999_000_000u64)
         );
         assert_eq!(bars[0].ts_init, ts_init);
     }
@@ -1704,6 +2063,7 @@ mod tests {
         }
 
         #[rstest]
+        #[case(1, BarAggregation::Second, BinanceKlineInterval::Second1)]
         #[case(1, BarAggregation::Minute, BinanceKlineInterval::Minute1)]
         #[case(3, BarAggregation::Minute, BinanceKlineInterval::Minute3)]
         #[case(5, BarAggregation::Minute, BinanceKlineInterval::Minute5)]
@@ -1731,14 +2091,14 @@ mod tests {
 
         #[rstest]
         fn test_unsupported_second_interval() {
-            let bar_spec = make_bar_spec(1, BarAggregation::Second);
+            let bar_spec = make_bar_spec(2, BarAggregation::Second);
             let result = bar_spec_to_binance_interval(bar_spec);
             assert!(result.is_err());
             assert!(
                 result
                     .unwrap_err()
                     .to_string()
-                    .contains("does not support second-level")
+                    .contains("Unsupported second interval")
             );
         }
 

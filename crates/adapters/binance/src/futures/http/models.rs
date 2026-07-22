@@ -52,7 +52,7 @@ use crate::{
         parse::parse_required_decimal,
     },
     futures::{
-        conversions::normalize_futures_asset,
+        conversions::{normalize_futures_asset, parse_good_till_date},
         websocket::streams::parse_exec::{order_type_has_limit_price, order_type_has_trigger_price},
     },
 };
@@ -80,6 +80,32 @@ pub struct BinanceFuturesTrade {
     /// Trade timestamp in milliseconds.
     pub time: i64,
     /// Whether the buyer is the maker.
+    pub is_buyer_maker: bool,
+}
+
+/// Aggregate public trade from `GET /fapi/v1/aggTrades` or `GET /dapi/v1/aggTrades`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinanceFuturesAggTrade {
+    /// Aggregate trade ID.
+    #[serde(rename = "a")]
+    pub id: i64,
+    /// Trade price.
+    #[serde(rename = "p")]
+    pub price: String,
+    /// Trade quantity.
+    #[serde(rename = "q")]
+    pub qty: String,
+    /// First raw trade ID represented by this aggregate.
+    #[serde(rename = "f")]
+    pub first_trade_id: i64,
+    /// Last raw trade ID represented by this aggregate.
+    #[serde(rename = "l")]
+    pub last_trade_id: i64,
+    /// Trade timestamp in milliseconds.
+    #[serde(rename = "T")]
+    pub time: i64,
+    /// Whether the buyer is the maker.
+    #[serde(rename = "m")]
     pub is_buyer_maker: bool,
 }
 
@@ -204,7 +230,7 @@ pub struct BinanceFuturesUsdSymbol {
     pub symbol: Ustr,
     /// Trading pair (e.g., "BTCUSDT").
     pub pair: Ustr,
-    /// Contract type (PERPETUAL, CURRENT_QUARTER, NEXT_QUARTER).
+    /// Contract type (PERPETUAL, CURRENT_MONTH, NEXT_MONTH, CURRENT_QUARTER, NEXT_QUARTER).
     pub contract_type: String,
     /// Delivery date timestamp.
     pub delivery_date: i64,
@@ -1151,6 +1177,10 @@ impl BinanceFuturesOrder {
             report = report.with_price(price);
         }
 
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
+        }
+
         report.avg_px = avg_px;
 
         Ok(report)
@@ -1377,6 +1407,9 @@ pub struct BinanceFuturesAlgoOrder {
     /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
     #[serde(default)]
     pub callback_rate: Option<String>,
+    /// Good till date in milliseconds.
+    #[serde(default)]
+    pub good_till_date: Option<i64>,
     /// Order creation time in milliseconds.
     #[serde(default)]
     pub create_time: Option<i64>,
@@ -1528,6 +1561,10 @@ impl BinanceFuturesAlgoOrder {
             report = report.with_reduce_only(reduce_only);
         }
 
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
+        }
+
         if let Some(trigger_time) = self.trigger_time {
             report = report.with_ts_triggered(UnixNanos::from_millis(trigger_time as u64));
         }
@@ -1605,6 +1642,7 @@ impl BinanceFuturesAlgoOrder {
         report.quantity = actual_report.quantity;
         report.filled_qty = actual_report.filled_qty;
         report.avg_px = actual_report.avg_px.or(report.avg_px);
+        report.expire_time = report.expire_time.or(actual_report.expire_time);
         report.ts_last = actual_report.ts_last;
 
         Ok(report)
@@ -2314,6 +2352,8 @@ mod tests {
         algo.avg_price = Some("49000.00".to_string());
         algo.reduce_only = Some(true);
         algo.trigger_time = Some(1_625_474_305_000);
+        algo.time_in_force = Some(BinanceTimeInForce::Gtd);
+        algo.good_till_date = Some(1_700_000_601_000);
 
         let mut actual = order_with_price("0");
         actual.order_id = 987654321;
@@ -2353,6 +2393,10 @@ mod tests {
         assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
         assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
         assert!(report.reduce_only);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
         assert_eq!(
             report.ts_triggered,
             Some(UnixNanos::from_millis(1_625_474_305_000))
@@ -2555,6 +2599,46 @@ mod tests {
         assert!(error.contains("invalid price"));
     }
 
+    #[rstest]
+    fn test_order_to_report_preserves_good_till_date() {
+        let mut order = order_with_price("50000.00");
+        order.time_in_force = BinanceTimeInForce::Gtd;
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_preserves_good_till_date() {
+        let mut order = algo_order_with_price(Some("50000.00"));
+        order.time_in_force = Some(BinanceTimeInForce::Gtd);
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
     fn order_with_price(price: &str) -> BinanceFuturesOrder {
         BinanceFuturesOrder {
             symbol: Ustr::from("BTCUSDT"),
@@ -2607,6 +2691,7 @@ mod tests {
             reduce_only: Some(false),
             activate_price: None,
             callback_rate: None,
+            good_till_date: Some(0),
             create_time: Some(1_625_474_304_765),
             update_time: Some(1_625_474_304_765),
             trigger_time: None,
@@ -2711,6 +2796,7 @@ mod tests {
             reduce_only: Some(false),
             activate_price: None,
             callback_rate: None,
+            good_till_date: Some(0),
             create_time: Some(1_625_474_304_765),
             update_time: Some(1_625_474_304_765),
             trigger_time: None,

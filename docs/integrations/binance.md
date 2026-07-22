@@ -11,8 +11,8 @@ features (noted inline). The Python adapter supports the same product types.
 Supported products:
 
 - **Binance Spot** (including Binance US)
-- **Binance USDT-Margined Futures** (perpetuals and delivery contracts)
-- **Binance Coin-Margined Futures** (perpetuals and delivery contracts)
+- **Binance USDT-Margined Futures** (perpetuals and current or next monthly and quarterly delivery contracts)
+- **Binance Coin-Margined Futures** (perpetuals and current or next quarterly delivery contracts)
 
 ## Examples
 
@@ -39,12 +39,12 @@ these lower-level components directly.
 
 ### Product support
 
-| Product Type                            | Supported | Notes                              |
-|-----------------------------------------|-----------|------------------------------------|
-| Spot Markets (incl. Binance US)         | ✓         |                                    |
-| Margin Accounts (Cross & Isolated)      | -         | *Not implemented.* Planned for v2. |
-| USDT-Margined Futures (PERP & Delivery) | ✓         |                                    |
-| Coin‑Margined Futures                   | ✓         |                                    |
+| Product Type                            | Supported | Notes                                      |
+|-----------------------------------------|-----------|--------------------------------------------|
+| Spot Markets (incl. Binance US)         | ✓         |                                            |
+| Margin Accounts (Cross & Isolated)      | -         | *Not implemented.* Planned for v2.         |
+| USDT-Margined Futures (PERP & Delivery) | ✓         | Monthly and quarterly delivery contracts.  |
+| Coin‑Margined Futures (PERP & Delivery) | ✓         | Quarterly delivery contracts.              |
 
 :::note
 Margin account features (borrow, repay, isolated margin management) are not implemented.
@@ -66,9 +66,10 @@ multi-client ID routing pattern.
 
 The integration includes several custom data types:
 
+- `BinanceSpotTicker`: Spot 24-hour ticker data including prices, volumes, and trade statistics.
 - `BinanceFuturesTicker`: Futures 24-hour ticker data including price and statistics.
 - `BinanceBar`: Bar data with additional volume metrics for historical and real-time use.
-- `BinanceFuturesMarkPriceUpdate`: Mark price updates for Binance Futures.
+- `BinanceFuturesMarkPriceUpdate`: Futures mark data including the estimated settlement price.
 - `BinanceFuturesLiquidation`: Futures liquidation events from the `forceOrder` stream.
 
 See the Binance [API Reference](/docs/python-api-latest/adapters/binance.html) for full definitions.
@@ -80,9 +81,30 @@ Because NautilusTrader supports multi-venue trading, it must distinguish between
 `BTCUSDT` the spot pair and `BTCUSDT` the perpetual futures contract (Binance
 uses the same symbol for both).
 
-Nautilus appends the `-PERP` suffix to all perpetual symbols. For example,
-the Binance Futures `BTCUSDT` perpetual contract becomes `BTCUSDT-PERP`
-within Nautilus.
+Nautilus appends `-PERP` to USD-M perpetual symbols. For example, the Binance
+USD-M `BTCUSDT` perpetual becomes `BTCUSDT-PERP`. Binance already names COIN-M
+perpetuals with `_PERP`, so `BTCUSD_PERP` remains unchanged.
+
+Delivery symbols keep Binance's `_YYMMDD` suffix. For example,
+`BTCUSDT_260925` and `BTCUSD_260925` remain unchanged within Nautilus. USD-M
+supports the documented `CURRENT_MONTH`, `NEXT_MONTH`, `CURRENT_QUARTER`, and
+`NEXT_QUARTER` contract types. COIN-M supports `CURRENT_QUARTER` and
+`NEXT_QUARTER`. Contract availability varies by environment and listing cycle.
+
+USD-M delivery instruments are linear and settle in the margin asset. COIN-M
+delivery instruments are inverse, settle in the margin asset (the base
+currency), and use Binance's `contractSize` as the instrument multiplier. Both
+use `onboardDate` and `deliveryDate` for activation and expiration. See
+Binance's official
+[USD-M common definitions](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/common-definition)
+and [COIN-M common definitions](https://developers.binance.com/en/docs/products/derivatives-trading-coin-futures/common-definition).
+
+The Rust Futures data tester accepts a delivery instrument without source edits:
+
+```bash
+BINANCE_FUTURES_INSTRUMENT_ID=BTCUSDT_260925.BINANCE \
+  cargo run -p nautilus-binance --example binance-futures-data-tester --features examples
+```
 
 ## Order capability
 
@@ -119,12 +141,36 @@ Only *limit* order types support `post_only`.
 
 ### Time in force
 
-| Time in force | Spot | Margin | USDT Futures | Coin Futures | Notes                                      |
-|---------------|------|--------|--------------|--------------|--------------------------------------------|
-| `GTC`         | ✓    | -      | ✓            | ✓            | Good Till Canceled.                        |
-| `GTD`         | ✓*   | -      | ✓            | ✓            | *Converted to GTC for Spot with warning.   |
-| `FOK`         | ✓    | -      | ✓            | ✓            | Fill or Kill.                              |
-| `IOC`         | ✓    | -      | ✓            | ✓            | Immediate or Cancel.                       |
+| Time in force | Spot | Margin | USDT Futures | Coin Futures | Notes                                          |
+|---------------|------|--------|--------------|--------------|------------------------------------------------|
+| `GTC`         | ✓    | -      | ✓            | ✓            | Good Till Canceled.                            |
+| `GTD`         | ✓*   | -      | ✓            | ✓*           | *Non‑default local mapping through `GTC`.      |
+| `FOK`         | ✓    | -      | ✓            | ✓            | Fill or Kill.                                  |
+| `IOC`         | ✓    | -      | ✓            | ✓            | Immediate or Cancel.                           |
+
+#### GTD policy
+
+[Binance Spot time-in-force values](https://github.com/binance/binance-spot-api-docs/blob/master/enums.md)
+are `GTC`, `IOC`, and `FOK`; Spot has no native `GTD` or `goodTillDate`. USD-M supports native
+`GTD` for `LIMIT` and the limit forms of `STOP` and `TAKE_PROFIT`. The adapter routes regular
+orders through HTTP or WebSocket trading, independent batches through HTTP `batchOrders`, and
+conditional algo orders through HTTP `algoOrder`. The current Binance WebSocket algo schema
+includes `goodTillDate` but does not include `GTD` in its `timeInForce` enum, so the adapter does
+not route GTD algo orders through that endpoint. COIN-M has no native `GTD` value or
+`goodTillDate` parameter in its documented order APIs. See the official
+[USD-M trade API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)
+and [COIN-M common definitions](https://developers.binance.com/en/docs/products/derivatives-trading-coin-futures/common-definition).
+
+USD-M `goodTillDate` is an epoch timestamp in milliseconds, but Binance ignores any sub-second
+part. Nautilus rejects an expiry that is not on a whole-second boundary rather than silently
+rounding it. The expiry must be strictly greater than the current time plus 600 seconds and
+strictly less than `253402300799000`. Native GTD also rejects market and post-only orders and any
+order without an expiry.
+
+`use_gtd=True` is the default. It uses native USD-M GTD and rejects native GTD on Spot and COIN-M.
+Set `use_gtd=False` only when the submitting strategy has `manage_gtd_expiry=True`. The adapter
+then warns and sends `GTC`, while Nautilus cancels the order at its local expiry. This preserves
+the v1 locally managed Spot policy without claiming venue-native GTD support.
 
 ### Advanced order features
 
@@ -139,7 +185,7 @@ Only *limit* order types support `post_only`.
 
 | Operation          | Spot | Margin | USDT Futures | Coin Futures | Notes                                        |
 |--------------------|------|--------|--------------|--------------|----------------------------------------------|
-| Batch Submit       | ✓    | -      | ✓            | ✓            | Orders submitted individually (no batch API call). |
+| Batch Submit       | ✓    | -      | ✓            | ✓            | Spot OCO or Futures `batchOrders`.             |
 | Batch Modify       | -    | -      | -            | -            | Not implemented.                             |
 | Batch Cancel       | -*   | -      | ✓            | ✓            | *Spot falls back to individual cancels.      |
 
@@ -442,9 +488,16 @@ available rate:
 - **Spot JSON diff depth**: 100ms
 - **Futures**: 0ms (unthrottled)
 
-Only one order book per instrument per trader instance is supported. When
-stream subscriptions vary, the Binance data client uses the latest order book
-data subscription (deltas or snapshots).
+`L1_MBP` subscriptions require depth 1 and use the Spot `bestBidAsk` or `bookTicker`
+stream and the Futures `bookTicker` stream. Each update emits the normal `QuoteTick`
+and a two-sided `OrderBookDeltas` batch with `F_MBP` flags so a managed L1 book receives
+the same top-of-book state. Quote and L1 subscriptions share the venue stream through
+reference counting. The client rejects concurrent L1 and L2 subscriptions for the same
+instrument.
+
+Explicit order-book snapshot requests are supported separately from subscription
+synchronization. Spot accepts depths from 1 through 5000. Futures accepts 5, 10, 20,
+50, 100, 500, or 1000.
 
 Order book snapshot rebuilds will be triggered on:
 
@@ -469,9 +522,31 @@ self-contained top-N snapshots. See [Spot market data mode](#spot-market-data-mo
 
 ## Binance data differences
 
-The `ts_event` field on `QuoteTick` differs between Spot and Futures. Spot
-does not provide an event timestamp, so the adapter uses `ts_init` (meaning
-`ts_event` and `ts_init` are identical).
+The `ts_event` field on `QuoteTick` differs between transports. Spot SBE uses the
+microsecond event timestamp. Spot public JSON `bookTicker` messages can omit an event
+timestamp, in which case the adapter uses `ts_init`. Futures uses the transaction time.
+
+## Bars and historical market data
+
+Spot supports one-second klines for subscriptions and historical requests. Real-time
+Spot kline subscriptions require `spot_market_data_mode=Json` because Binance does not
+publish kline or ticker streams over Spot SBE. Binance Futures rejects second-level
+klines because the Futures API does not offer them.
+
+Closed venue klines emit a core `Bar` and a `BinanceBar` custom-data event. `BinanceBar`
+retains quote volume, trade count, taker-buy base volume, and taker-buy quote volume.
+Historical core bar requests return `Bar`; request `BinanceBar` custom data with
+`bar_type` metadata to retain the extended fields in historical responses.
+
+Historical trade requests without bounds use the recent-trades endpoint. A request with
+time bounds uses aggregate trades and accepts at most 1000 records. Spot passes the
+supplied bounds to `/api/v3/aggTrades`. Futures accepts either bound within the last 24
+hours; when both are supplied, the range must be shorter than one hour.
+
+Historical core bar requests accept externally aggregated time bars and use the corresponding
+venue kline endpoint. Internally aggregated bars are built by the `DataEngine` from raw trade,
+quote, or source-bar responses through the `bar_types` request parameter; the Binance data client
+does not aggregate them.
 
 ## Binance specific data
 
@@ -483,10 +558,30 @@ normal way via the Rust adapter. The custom data subscriptions below are for
 the Python adapter.
 :::
 
-Binance USD-M mark-price payloads may include an `ap` moving-average field. The Rust
-adapter parses this raw venue field but does not emit it as domain data or
-Binance custom data; Nautilus mark-price subscriptions emit mark, index, and
-funding-rate updates from the same stream.
+Binance Futures mark-price payloads preserve the venue `P` estimated settlement price in
+`BinanceFuturesMarkPriceUpdate`. Nautilus also emits standard mark-price, index-price, and
+funding-rate updates from the same stream. The optional USD-M `ap` moving-average field is
+parsed at the transport boundary but is not exposed as domain or custom data.
+
+### `BinanceSpotTicker`
+
+Spot 24-hour ticker custom data requires public JSON market-data mode and an
+`instrument_id` metadata value:
+
+```python
+from nautilus_trader.core import nautilus_pyo3 as pyo3
+
+self.subscribe_data(
+    data_type=pyo3.DataType(
+        "BinanceSpotTicker",
+        {"instrument_id": "BTCUSDT.BINANCE"},
+    ),
+    client_id=pyo3.ClientId.from_str("BINANCE"),
+)
+```
+
+The adapter subscribes to the instrument `@ticker` stream. SBE mode rejects this
+subscription because Binance Spot SBE does not provide the stream.
 
 ### `BinanceFuturesTicker`
 
@@ -650,6 +745,14 @@ info (e.g. after delisting or contract expiry), the adapter emits
 | Halt               | Halt                       |
 | AuctionMatch       | Cross                      |
 | Break              | Pause                      |
+| PreDelivering      | PreClose                   |
+| Delivering         | Close                      |
+| Delivered          | Close                      |
+| PreSettle          | PreClose                   |
+| Settling           | Close                      |
+| Close              | Close                      |
+| TradingHalt        | Halt                       |
+| TradingCancelOnly  | Halt                       |
 
 #### Futures (COIN-M)
 
@@ -666,6 +769,8 @@ info (e.g. after delisting or contract expiry), the adapter emits
 | PreDelisting       | PreClose                   |
 | Delisting          | Suspend                    |
 | Down               | NotAvailableForTrading     |
+| TradingHalt        | Halt                       |
+| TradingCancelOnly  | Halt                       |
 
 :::note
 Only instruments that are in a tradable state at connect time are tracked.
@@ -789,7 +894,7 @@ definitive list of Rust config options.
 | `proxy_url`                             | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
 | `us`                                    | `False`   | Route requests to Binance US endpoints when `True`. |
 | `environment`                           | `None`    | Binance environment: `LIVE`, `TESTNET`, or `DEMO`. Defaults to `LIVE` when `None`. |
-| `use_gtd`                               | `True`    | When `False`, remaps GTD orders to GTC for local expiry management. |
+| `use_gtd`                               | `True`    | Use native USD-M GTD. Set `False` only with strategy `manage_gtd_expiry=True`; GTD then maps to GTC with a warning. |
 | `use_reduce_only`                       | `True`    | When `True`, passes through `reduce_only` instructions to Binance. |
 | `use_position_ids`                      | `True`    | Enable Binance hedging position IDs; set `False` for virtual hedging. |
 | `use_trade_lite`                        | `False`   | Use TRADE_LITE execution events that include derived fees. |
@@ -1277,11 +1382,17 @@ All-market array streams (`!ticker@arr`, `!miniTicker@arr`, `!bookTicker`,
 
 #### Rate-limit pools
 
-UM and CM share a single rate-limit pool per IP (2400 weight/min,
-1200 orders/min, 300 orders/10s). The adapter creates separate HTTP client
-instances for UM and CM, each with its own rate limiter. If a node drives both
-UM and CM clients simultaneously, the combined traffic may exceed the shared
-server-side budget.
+UM and CM share Binance rate-limit pools: 2400 weight/min per IP, plus
+1200 orders/min and 300 orders/10s per account. Rust futures HTTP clients in the
+same process share request-weight state across UM and CM for the same environment
+or custom endpoint scope and configured egress path. They share order-count state
+across UM and CM when authenticated with the same API key, regardless of egress
+path.
+
+Live, testnet, demo, and unrelated custom endpoint scopes remain isolated.
+Different configured egress paths have separate request-weight state, while
+different API keys have separate order-count state. Separate processes and
+multiple API keys for one Binance account still require external coordination.
 
 #### dualSidePosition
 

@@ -78,8 +78,8 @@ use crate::{
         data::{
             client::{AxMdWebSocketClient, AxWsClientError, SymbolDataTypes},
             parse::{
-                parse_book_l1_quote, parse_book_l2_deltas, parse_book_l3_deltas, parse_candle_bar,
-                parse_trade_tick,
+                parse_book_l1_quote, parse_book_l2_deltas, parse_book_l2_quote,
+                parse_book_l3_deltas, parse_book_l3_quote, parse_candle_bar, parse_trade_tick,
             },
         },
         messages::{AxDataWsMessage, AxMdCandle, AxMdMessage},
@@ -1179,6 +1179,19 @@ fn handle_md_message(
                 }
                 Err(e) => log::error!("Failed to parse L2 to OrderBookDeltas: {e}"),
             }
+
+            let quotes_subscribed = sdt_snap
+                .get(symbol.as_str())
+                .is_some_and(|entry| entry.quotes);
+
+            if quotes_subscribed {
+                match parse_book_l2_quote(&book, instrument, ts_init()) {
+                    Ok(quote) => {
+                        let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
+                    }
+                    Err(e) => log::error!("Failed to parse L2 to QuoteTick: {e}"),
+                }
+            }
         }
         AxMdMessage::BookL3(book) => {
             let symbol = book.s;
@@ -1198,6 +1211,19 @@ fn handle_md_message(
                 }
                 Err(e) => log::error!("Failed to parse L3 to OrderBookDeltas: {e}"),
             }
+
+            let quotes_subscribed = sdt_snap
+                .get(symbol.as_str())
+                .is_some_and(|entry| entry.quotes);
+
+            if quotes_subscribed {
+                match parse_book_l3_quote(&book, instrument, ts_init()) {
+                    Ok(quote) => {
+                        let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
+                    }
+                    Err(e) => log::error!("Failed to parse L3 to QuoteTick: {e}"),
+                }
+            }
         }
         AxMdMessage::Ticker(ticker) => {
             let Some(instrument) = instruments_snap.get(&ticker.s) else {
@@ -1214,6 +1240,7 @@ fn handle_md_message(
             let mark_prices_subscribed = sdt_snap
                 .get(ticker.s.as_str())
                 .is_some_and(|e| e.mark_prices);
+
             if mark_prices_subscribed && let Some(mark_price) = ticker.m {
                 match Price::from_decimal_dp(mark_price, price_precision) {
                     Ok(price) => {
@@ -1230,6 +1257,7 @@ fn handle_md_message(
                 let status_subscribed = sdt_snap
                     .get(ticker.s.as_str())
                     .is_some_and(|e| e.instrument_status);
+
                 if status_subscribed {
                     let prev = instrument_states.insert(ticker.s, state);
                     if prev != Some(state) {
@@ -1328,12 +1356,13 @@ mod tests {
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::*;
     use crate::websocket::{
         data::client::SymbolDataTypes,
-        messages::{AxMdMessage, AxMdTicker},
+        messages::{AxBookLevel, AxMdBookL2, AxMdMessage, AxMdTicker},
     };
 
     #[rstest]
@@ -1573,5 +1602,67 @@ mod tests {
 
         let statuses = collect_instrument_statuses(&mut rx);
         assert!(statuses.is_empty());
+    }
+
+    #[rstest]
+    fn test_l2_book_emits_quote_when_quotes_subscribed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let instruments = Arc::new(AtomicMap::new());
+        instruments.insert(Ustr::from("EURUSD-PERP"), ticker_test_instrument());
+
+        let sdt = Arc::new(AtomicMap::new());
+        sdt.insert(
+            "EURUSD-PERP".to_string(),
+            SymbolDataTypes {
+                quotes: true,
+                book_level: Some(AxMarketDataLevel::Level2),
+                ..Default::default()
+            },
+        );
+
+        let mut book_sequences = AHashMap::new();
+        let mut candle_cache = AHashMap::new();
+        let mut instrument_states = AHashMap::new();
+        let clock = get_atomic_clock_realtime();
+        let message = AxMdMessage::BookL2(AxMdBookL2 {
+            ts: 1_700_000_000,
+            tn: 123,
+            s: Ustr::from("EURUSD-PERP"),
+            b: vec![AxBookLevel {
+                p: dec!(1.1441),
+                q: 100,
+            }],
+            a: vec![AxBookLevel {
+                p: dec!(1.1448),
+                q: 200,
+            }],
+            st: true,
+        });
+
+        handle_md_message(
+            message,
+            &tx,
+            &instruments,
+            &sdt,
+            &mut book_sequences,
+            &mut candle_cache,
+            &mut instrument_states,
+            clock,
+        );
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let quote = events.iter().find_map(|event| match event {
+            DataEvent::Data(Data::Quote(quote)) => Some(quote),
+            _ => None,
+        });
+
+        assert_eq!(
+            quote.map(|quote| quote.bid_price),
+            Some(Price::from("1.1441"))
+        );
+        assert_eq!(
+            quote.map(|quote| quote.ask_price),
+            Some(Price::from("1.1448"))
+        );
     }
 }

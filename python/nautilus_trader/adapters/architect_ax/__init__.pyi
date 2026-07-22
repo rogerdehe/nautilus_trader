@@ -20,6 +20,32 @@ __all__ = [
 
 @typing.final
 class AxDataClientConfig:
+    @property
+    def environment(self) -> AxEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_ws_public(self) -> str | None: ...
+    @property
+    def base_url_ws_private(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def recv_window_ms(self) -> int: ...
+    @property
+    def update_instruments_interval_mins(self) -> int: ...
+    @property
+    def funding_rate_poll_interval_mins(self) -> int: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         api_key: str | None = None,
@@ -39,9 +65,39 @@ class AxDataClientConfig:
         funding_rate_poll_interval_mins: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class AxExecClientConfig:
+    @property
+    def trader_id(self) -> model.TraderId: ...
+    @property
+    def account_id(self) -> model.AccountId: ...
+    @property
+    def environment(self) -> AxEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_orders(self) -> str | None: ...
+    @property
+    def base_url_ws_private(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def recv_window_ms(self) -> int: ...
+    @property
+    def cancel_on_disconnect(self) -> bool: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         trader_id: model.TraderId | None = None,
@@ -62,6 +118,8 @@ class AxExecClientConfig:
         cancel_on_disconnect: bool | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class AxHttpClient:
@@ -114,6 +172,9 @@ class AxHttpClient:
         start: datetime.datetime | None = None,
         end: datetime.datetime | None = None,
     ) -> typing.Any: ...
+    def request_book_snapshot(
+        self, instrument_id: model.InstrumentId, depth: int | None = None
+    ) -> typing.Any: ...
     def request_funding_rates(
         self,
         instrument_id: model.InstrumentId,
@@ -131,7 +192,11 @@ class AxHttpClient:
         client_order_id: model.ClientOrderId | None = None,
         venue_order_id: model.VenueOrderId | None = None,
     ) -> typing.Any: ...
-    def request_order_status_reports(self, account_id: model.AccountId) -> typing.Any: ...
+    def request_order_status_reports(
+        self,
+        account_id: model.AccountId,
+        client_order_ids: typing.Sequence[model.ClientOrderId] | None = None,
+    ) -> typing.Any: ...
     def request_fill_reports(self, account_id: model.AccountId) -> typing.Any: ...
     def request_position_reports(self, account_id: model.AccountId) -> typing.Any: ...
     def preview_aggressive_limit_order(
@@ -141,11 +206,19 @@ class AxHttpClient:
 @typing.final
 class AxMdWebSocketClient:
     def __init__(
-        self, url: str, auth_token: str, heartbeat: int = 30, proxy_url: str | None = None
+        self,
+        url: str,
+        auth_token: str,
+        heartbeat: int = 30,
+        proxy_url: str | None = None,
+        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
     @staticmethod
     def without_auth(
-        url: str, heartbeat: int = 30, proxy_url: str | None = None
+        url: str,
+        heartbeat: int = 30,
+        proxy_url: str | None = None,
+        transport_backend: network.TransportBackend | None = None,
     ) -> AxMdWebSocketClient: ...
     @property
     def url(self) -> str: ...
@@ -182,6 +255,7 @@ class AxOrdersWebSocketClient:
         trader_id: model.TraderId,
         heartbeat: int = 30,
         proxy_url: str | None = None,
+        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -206,11 +280,9 @@ class AxOrdersWebSocketClient:
         instrument_id: model.InstrumentId,
         client_order_id: model.ClientOrderId,
         order_side: model.OrderSide,
-        order_type: model.OrderType,
         quantity: model.Quantity,
         time_in_force: model.TimeInForce,
-        price: model.Price | None = None,
-        trigger_price: model.Price | None = None,
+        price: model.Price,
         post_only: bool = False,
     ) -> typing.Any: ...
     def cancel_order(

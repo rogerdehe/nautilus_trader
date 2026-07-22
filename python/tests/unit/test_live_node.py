@@ -15,7 +15,9 @@
 
 import pytest
 
+from nautilus_trader.common import Cache
 from nautilus_trader.common import CacheConfig
+from nautilus_trader.common import ComponentState
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
 from nautilus_trader.common import Environment
@@ -27,7 +29,11 @@ from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveNodeConfig
 from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.live import PortfolioConfig
+from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model import TraderId
+from nautilus_trader.portfolio import Portfolio
+from nautilus_trader.trading import ExecutionAlgorithm
+from nautilus_trader.trading import ExecutionAlgorithmConfig
 from nautilus_trader.trading import ImportableControllerConfig
 from nautilus_trader.trading import ImportableExecAlgorithmConfig
 from nautilus_trader.trading import ImportableStrategyConfig
@@ -63,6 +69,13 @@ class RequiredConfigLiveActor(DataActor):
         super().__init__()
         type(self).received_actor_id = str(config.actor_id)
         type(self).received_label = config.required_label
+
+
+class LifecycleExecutionAlgorithm(ExecutionAlgorithm):
+    start_observations = []
+
+    def on_start(self):
+        type(self).start_observations.append((self.state, self.is_running()))
 
 
 def test_importable_actor_config_construction():
@@ -132,6 +145,53 @@ def test_live_node_config_registers_importable_controller():
     assert node.trader_id == trader_id
     assert ControllerRegistrationProbe.constructed == 1
     assert ControllerRegistrationProbe.received_actor_id == "Controller-001"
+
+
+def test_live_node_exposes_cache_and_portfolio_inspection():
+    node = LiveNode.build(
+        "TEST",
+        LiveNodeConfig(
+            trader_id=TraderId("TESTER-010"),
+            environment=Environment.SANDBOX,
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
+        ),
+    )
+
+    try:
+        assert isinstance(node.cache, Cache)
+        assert node.cache.instrument_ids() == []
+        assert node.cache.orders() == []
+        assert node.cache.positions() == []
+        assert isinstance(node.portfolio, Portfolio)
+        assert node.portfolio.is_initialized() is False
+    finally:
+        node.dispose()
+
+
+def test_live_node_poll_requires_running_node_and_returns_processed_count():
+    node = LiveNode.build(
+        "TEST",
+        LiveNodeConfig(
+            trader_id=TraderId("TESTER-011"),
+            environment=Environment.SANDBOX,
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
+            timeout_connection_secs=0,
+            timeout_reconciliation_secs=0,
+            timeout_portfolio_secs=0,
+            timeout_disconnection_secs=0,
+            delay_post_stop_secs=0,
+            timeout_shutdown_secs=0,
+        ),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="LiveNode is not running"):
+            node.poll()
+
+        node.start()
+        assert node.poll() == 0
+    finally:
+        node.dispose()
 
 
 @pytest.mark.parametrize(
@@ -416,6 +476,109 @@ def test_add_exec_algorithm_from_config_registers(live_node):
     )
 
     live_node.add_exec_algorithm_from_config(config)
+
+
+def test_add_exec_algorithm_from_config_registers_v2_instance(live_node):
+    config = ImportableExecAlgorithmConfig(
+        exec_algorithm_path="strategies.backtest_surface:RoutedOrderExecutionAlgorithm",
+        config_path="strategies.backtest_surface:RoutedOrderExecAlgorithmConfig",
+        config={"exec_algorithm_id": "PY-LIVE-CONFIG"},
+    )
+
+    live_node.add_exec_algorithm_from_config(config)
+
+    with pytest.raises(RuntimeError, match="'PY-LIVE-CONFIG' is already registered"):
+        live_node.add_exec_algorithm_from_config(config)
+
+
+def test_add_exec_algorithm_registers_constructed_instance(live_node):
+    exec_algorithm_id = ExecAlgorithmId("PY-LIVE-CONSTRUCTED")
+    LifecycleExecutionAlgorithm.start_observations = []
+    exec_algorithm = LifecycleExecutionAlgorithm(
+        ExecutionAlgorithmConfig(
+            exec_algorithm_id=exec_algorithm_id,
+            log_events=False,
+            log_commands=False,
+        ),
+    )
+
+    live_node.add_exec_algorithm(exec_algorithm)
+
+    assert exec_algorithm.exec_algorithm_id == exec_algorithm_id
+    assert exec_algorithm.is_registered() is True
+    assert exec_algorithm.is_ready() is True
+    assert exec_algorithm.portfolio.is_initialized() is False
+
+    exec_algorithm.start()
+    assert exec_algorithm.is_running() is True
+    assert LifecycleExecutionAlgorithm.start_observations == [(ComponentState.STARTING, False)]
+
+    exec_algorithm.stop()
+    assert exec_algorithm.is_stopped() is True
+
+    exec_algorithm.resume()
+    assert exec_algorithm.is_running() is True
+
+    exec_algorithm.degrade()
+    assert exec_algorithm.is_degraded() is True
+
+    exec_algorithm.resume()
+    assert exec_algorithm.is_running() is True
+
+    exec_algorithm.stop()
+    assert exec_algorithm.is_stopped() is True
+
+    exec_algorithm.reset()
+    assert exec_algorithm.is_ready() is True
+
+    duplicate = ExecutionAlgorithm(
+        ExecutionAlgorithmConfig(exec_algorithm_id=exec_algorithm_id),
+    )
+
+    with pytest.raises(RuntimeError, match="'PY-LIVE-CONSTRUCTED' is already registered"):
+        live_node.add_exec_algorithm(duplicate)
+
+
+def test_add_exec_algorithm_rejects_running_node():
+    node = LiveNode.build(
+        "TEST",
+        LiveNodeConfig(
+            trader_id=TraderId("TESTER-008"),
+            environment=Environment.SANDBOX,
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
+            timeout_connection_secs=0,
+            timeout_reconciliation_secs=0,
+            timeout_portfolio_secs=0,
+            timeout_disconnection_secs=0,
+            delay_post_stop_secs=0,
+            timeout_shutdown_secs=0,
+        ),
+    )
+    exec_algorithm = ExecutionAlgorithm(
+        ExecutionAlgorithmConfig(exec_algorithm_id=ExecAlgorithmId("PY-LIVE-RUNNING")),
+    )
+
+    try:
+        node.start()
+        with pytest.raises(RuntimeError) as exc_info:
+            node.add_exec_algorithm(exec_algorithm)
+    finally:
+        node.dispose()
+
+    assert str(exc_info.value) == (
+        "Cannot add exec algorithm while node is running, "
+        "add exec algorithms before calling start()"
+    )
+    assert exec_algorithm.is_registered() is False
+    assert node.is_running is False
+
+
+def test_add_exec_algorithm_rejects_data_actor_instance(live_node):
+    with pytest.raises(
+        RuntimeError,
+        match="requires a Python v2 ExecutionAlgorithm instance",
+    ):
+        live_node.add_exec_algorithm(DataActor())
 
 
 def test_add_exec_algorithm_from_config_rejects_invalid_path(live_node):

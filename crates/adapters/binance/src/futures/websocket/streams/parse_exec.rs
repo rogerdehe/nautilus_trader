@@ -48,7 +48,7 @@ use crate::{
             parse_required_quantity_at_precision,
         },
     },
-    futures::conversions::normalize_futures_asset,
+    futures::conversions::{normalize_futures_asset, parse_good_till_date},
 };
 
 /// Converts a Binance Futures order update to a Nautilus order status report.
@@ -123,6 +123,10 @@ pub fn parse_futures_order_update_to_order_status(
     }
     report.post_only = order.order_type == BinanceFuturesOrderType::Limit
         && order.time_in_force == BinanceTimeInForce::Gtx;
+
+    if let Some(expire_time) = parse_good_till_date(order.good_till_date)? {
+        report.expire_time = Some(expire_time);
+    }
 
     if order_type_has_trigger_price(order_type)
         && let Some(stop_price) =
@@ -355,6 +359,10 @@ pub fn parse_futures_algo_update_to_order_status(
     {
         report.trigger_price = Some(trigger_price);
         report.trigger_type = Some(parse_working_type(algo_data.working_type));
+    }
+
+    if let Some(expire_time) = parse_good_till_date(algo_data.good_till_date)? {
+        report.expire_time = Some(expire_time);
     }
 
     Ok(Some(report))
@@ -728,6 +736,31 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_order_update_to_order_status_preserves_good_till_date() {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.time_in_force = BinanceTimeInForce::Gtd;
+        msg.order.good_till_date = Some(1_700_000_601_000);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
+    #[rstest]
     fn test_parse_order_update_to_order_status_rejects_invalid_quantity() {
         let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
         msg.order.original_qty = "not-a-number".to_string();
@@ -1034,6 +1067,33 @@ mod tests {
             UnixNanos::from(1_750_515_742_303_000_000u64)
         );
         assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_algo_update_to_order_status_preserves_good_till_date() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.time_in_force = BinanceTimeInForce::Gtd;
+        msg.algo_order.good_till_date = Some(1_700_000_601_000);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_algo_update_to_order_status(
+            &msg.algo_order,
+            msg.event_time,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            ts_init,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
     }
 
     #[rstest]
