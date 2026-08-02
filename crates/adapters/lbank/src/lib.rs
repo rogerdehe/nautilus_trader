@@ -22,6 +22,7 @@
 
 pub mod common;
 pub mod config;
+pub mod contract_data;
 pub mod data;
 pub mod execution;
 pub mod factories;

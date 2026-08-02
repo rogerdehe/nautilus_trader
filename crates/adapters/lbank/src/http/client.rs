@@ -35,8 +35,9 @@ use uuid::Uuid;
 use crate::{
     common::{
         consts::{
-            EP_ACCOUNT, EP_ACCURACY, EP_CANCEL_ORDER, EP_CREATE_ORDER, EP_CURRENCY_PAIRS, EP_DEPTH,
-            EP_TRADES, LBANK_SPOT_HTTP_URL, SIGNATURE_METHOD_HMAC,
+            CONTRACT_PRODUCT_GROUP_SWAP_U, EP_ACCOUNT, EP_ACCURACY, EP_CANCEL_ORDER,
+            EP_CONTRACT_INSTRUMENT, EP_CREATE_ORDER, EP_CURRENCY_PAIRS, EP_DEPTH, EP_TRADES,
+            LBANK_SPOT_HTTP_URL, SIGNATURE_METHOD_HMAC,
         },
         credential::Credential,
         parse::instrument_id_from_lbank_symbol,
@@ -44,10 +45,14 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            LBankAccount, LBankAccuracy, LBankCancelOrderResult, LBankCreateOrderRequest,
-            LBankCreateOrderResult, LBankDepth, LBankResponse, LBankRestTrade,
+            LBankAccount, LBankAccuracy, LBankCancelOrderResult, LBankContractInstrument,
+            LBankCreateOrderRequest, LBankCreateOrderResult, LBankDepth, LBankResponse,
+            LBankRestTrade,
         },
-        parse::{instrument_from_accuracy, parse_depth_snapshot, parse_rest_trade_tick},
+        parse::{
+            instrument_from_accuracy, instrument_from_contract, parse_depth_snapshot,
+            parse_rest_trade_tick,
+        },
     },
 };
 
@@ -282,6 +287,29 @@ impl LbankHttpClient {
             match instrument_from_accuracy(acc, ts_init) {
                 Ok(inst) => out.push(inst),
                 Err(e) => log::debug!("Skipping LBank instrument '{}': {e}", acc.symbol),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetches CONTRACT (USDT-perp) instruments from `cfd/openApi/v1/pub/instrument?productGroup=SwapU`.
+    /// The client's `base_url` must be set to the contract host ([`LBANK_CONTRACT_HTTP_URL`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport/status/envelope failure.
+    pub async fn request_contract_instruments(&self) -> Result<Vec<InstrumentAny>> {
+        let query = format!("productGroup={CONTRACT_PRODUCT_GROUP_SWAP_U}");
+        let rows: Vec<LBankContractInstrument> =
+            self.get_public(EP_CONTRACT_INSTRUMENT, &query).await?;
+        let ts_init = self.clock_ns();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match instrument_from_contract(row, ts_init) {
+                Ok(inst) => out.push(inst),
+                Err(e) => {
+                    log::debug!("Skipping LBank contract instrument '{}': {e}", row.symbol);
+                }
             }
         }
         Ok(out)

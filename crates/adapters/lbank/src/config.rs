@@ -17,7 +17,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::consts::{LBANK_SPOT_HTTP_URL, LBANK_SPOT_WS_URL};
+use crate::common::consts::{
+    LBANK_CONTRACT_HTTP_URL, LBANK_CONTRACT_WS_V3_URL, LBANK_SPOT_HTTP_URL, LBANK_SPOT_WS_URL,
+};
 
 /// Configuration for the LBank data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
@@ -29,10 +31,13 @@ pub struct LbankDataClientConfig {
     pub api_secret: Option<String>,
     /// Override for the REST base host.
     pub base_url_http: Option<String>,
-    /// Override for the spot WebSocket URL.
+    /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP transport.
     pub proxy_url: Option<String>,
+    /// Product: `spot` (default) or `perp_linear`/`perp`/`swap`/`contract` for USDT-perp futures.
+    /// Selects the spot vs contract data client + endpoints.
+    pub product: Option<String>,
     /// HTTP timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
@@ -74,6 +79,31 @@ impl LbankDataClientConfig {
         self.base_url_ws
             .clone()
             .unwrap_or_else(|| LBANK_SPOT_WS_URL.to_string())
+    }
+
+    /// `true` when the product selects USDT-perp contract futures (vs spot).
+    #[must_use]
+    pub fn is_contract(&self) -> bool {
+        matches!(
+            self.product.as_deref().map(str::trim),
+            Some("perp_linear" | "perp" | "swap" | "contract" | "futures" | "perpetual")
+        )
+    }
+
+    /// Returns the CONTRACT REST base host, honoring any override.
+    #[must_use]
+    pub fn contract_http_url(&self) -> String {
+        self.base_url_http
+            .clone()
+            .unwrap_or_else(|| LBANK_CONTRACT_HTTP_URL.to_string())
+    }
+
+    /// Returns the CONTRACT v3 market-data WebSocket URL, honoring any override.
+    #[must_use]
+    pub fn contract_ws_url(&self) -> String {
+        self.base_url_ws
+            .clone()
+            .unwrap_or_else(|| LBANK_CONTRACT_WS_V3_URL.to_string())
     }
 }
 

@@ -48,6 +48,19 @@ pub fn split_base_quote(lbank_symbol: &str) -> Option<(String, String)> {
     }
 }
 
+/// Converts an LBank CONTRACT symbol (`BTCUSDT`, no underscore) to a Nautilus [`InstrumentId`]
+/// (`BTCUSDT.LBANK`). Contract symbols are uppercase and NOT underscore-delimited (unlike spot).
+#[must_use]
+pub fn instrument_id_from_contract_symbol(contract_symbol: &str) -> InstrumentId {
+    InstrumentId::new(Symbol::from(contract_symbol.to_uppercase().as_str()), lbank_venue())
+}
+
+/// Converts a Nautilus [`InstrumentId`] back to the LBank contract symbol (`BTCUSDT`).
+#[must_use]
+pub fn contract_symbol_from_instrument_id(instrument_id: &InstrumentId) -> String {
+    instrument_id.symbol.as_str().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

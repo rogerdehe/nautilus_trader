@@ -13,8 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! LBank spot WebSocket layer: full-snapshot depth + trade streams with app-level ping/pong.
+//! LBank WebSocket layer: spot full-snapshot depth + trade (app ping/pong), and the contract v3
+//! compact protocol (active client ping, top-25 native-tick depth + trades).
 
 pub mod client;
+pub mod contract_client;
+pub mod contract_messages;
+pub mod contract_parse;
 pub mod messages;
 pub mod parse;

@@ -32,6 +32,7 @@ use nautilus_model::{
 use crate::{
     common::consts::{LBANK, lbank_venue},
     config::{LbankDataClientConfig, LbankExecClientConfig},
+    contract_data::LbankContractDataClient,
     data::LbankDataClient,
     execution::LbankExecutionClient,
 };
@@ -79,6 +80,11 @@ impl DataClientFactory for LbankDataClientFactory {
             .clone();
 
         let client_id = ClientId::from(name);
+        // Route to the contract (USDT-perp) data client when the product selects futures.
+        if lbank_config.is_contract() {
+            let client = LbankContractDataClient::new(client_id, lbank_config)?;
+            return Ok(Box::new(client));
+        }
         let client = LbankDataClient::new(client_id, lbank_config)?;
         Ok(Box::new(client))
     }

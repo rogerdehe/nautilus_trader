@@ -35,9 +35,37 @@ pub const LBANK_SPOT_HTTP_URL: &str = "https://api.lbkex.com";
 /// Spot public WebSocket (full-snapshot depth + trades).
 pub const LBANK_SPOT_WS_URL: &str = "wss://www.lbkex.net/ws/V2/";
 
-// Contract (perp) hosts — implemented as a follow-up after spot.
+// Contract (perp) REST host — public market-data endpoints under `/cfd/openApi/v1/pub`.
 pub const LBANK_CONTRACT_HTTP_URL: &str = "https://lbkperp.lbank.com";
+// Legacy/execution contract WS (kept for reference; NOT the market-data stream).
 pub const LBANK_CONTRACT_WS_URL: &str = "wss://lbkperpws.lbank.com/ws";
+/// Contract PUBLIC market-data WebSocket (v3), reverse-engineered from the LBank futures front-end
+/// (`cfdWsUrl`). This is the stream the web UI actually consumes for depth + trades. The prod host
+/// is deliberately obfuscated by LBank and MAY ROTATE — override via `base_url_ws` if it changes.
+pub const LBANK_CONTRACT_WS_V3_URL: &str = "wss://uuws.rerrkvifj.com/ws/v3";
+
+// Contract public REST endpoints (productGroup=SwapU for USDT-margined perps).
+pub const EP_CONTRACT_INSTRUMENT: &str = "/cfd/openApi/v1/pub/instrument";
+pub const CONTRACT_PRODUCT_GROUP_SWAP_U: &str = "SwapU";
+
+// Contract v3 WS protocol (compact, key-renamed). The subscribe envelope is
+// `{"x":<topic>,"a":{"i":"<SYMBOL>"},"z":<type>,"y":<sub_id>}`; pushes are
+// `{"d":<data>,"w":<ms>,"x":<topic>,"z":<type>}`. Topics are the numeric `KK` enum.
+pub const CONTRACT_WS_TOPIC_MARKET: u8 = 1;
+pub const CONTRACT_WS_TOPIC_KLINE: u8 = 2;
+pub const CONTRACT_WS_TOPIC_ORDERBOOK: u8 = 3;
+pub const CONTRACT_WS_TOPIC_DEAL: u8 = 4;
+/// Subscribe (`z`) type: Sub=1, UnSub=0.
+pub const CONTRACT_WS_TYPE_SUB: u8 = 1;
+pub const CONTRACT_WS_TYPE_UNSUB: u8 = 0;
+/// Push (`z`) type on inbound data frames.
+pub const CONTRACT_WS_TYPE_PUSH: u8 = 4;
+/// Client keepalive interval (seconds); the v3 server drops connections without an app-level ping.
+pub const CONTRACT_WS_PING_SECS: u64 = 5;
+/// OrderBook level count — LBank's contract depth channel is a TOP-N snapshot fixed at 25 (higher
+/// `limit` values return no data). The book is merged at the requested price-group step; passing the
+/// instrument's native tick yields the finest book available.
+pub const CONTRACT_WS_DEPTH_LIMIT: u32 = 25;
 
 // Spot public endpoints (all suffixed `.do`).
 pub const EP_TIMESTAMP: &str = "/v2/timestamp.do";

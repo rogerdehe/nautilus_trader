@@ -113,6 +113,35 @@ pub struct LBankRestTrade {
     pub is_buyer_maker: Option<bool>,
 }
 
+/// One CONTRACT (USDT-perp) instrument from `GET /cfd/openApi/v1/pub/instrument?productGroup=SwapU`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LBankContractInstrument {
+    /// Contract symbol, e.g. `BTCUSDT` (no underscore).
+    pub symbol: String,
+    /// Base currency, e.g. `BTC`.
+    #[serde(rename = "baseCurrency", default)]
+    pub base_currency: Option<String>,
+    /// Quote (price) currency, e.g. `USDT`.
+    #[serde(rename = "priceCurrency", default)]
+    pub price_currency: Option<String>,
+    /// Settlement (clearing) currency, e.g. `USDT`.
+    #[serde(rename = "clearCurrency", default)]
+    pub clear_currency: Option<String>,
+    /// Price tick / minimum price increment (e.g. `0.1`). Also the native price-group step used to
+    /// build the OrderBook WS subscribe id.
+    #[serde(rename = "priceTick", default)]
+    pub price_tick: Option<f64>,
+    /// Volume tick / minimum size increment (e.g. `0.0001`).
+    #[serde(rename = "volumeTick", default)]
+    pub volume_tick: Option<f64>,
+    /// Contract multiplier (base units per contract), e.g. `1.0`.
+    #[serde(rename = "volumeMultiple", default)]
+    pub volume_multiple: Option<f64>,
+    /// Minimum order volume.
+    #[serde(rename = "minOrderVolume", default)]
+    pub min_order_volume: Option<FlexStr>,
+}
+
 /// Request parameters for `POST /v2/supplement/create_order.do` (business params; the signed system
 /// params `api_key`/`echostr`/`signature_method`/`timestamp`/`sign` are added by the client).
 #[derive(Clone, Debug)]

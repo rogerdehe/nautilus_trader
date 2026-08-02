@@ -23,14 +23,18 @@ use nautilus_model::{
     data::{BookOrder, OrderBookDelta, OrderBookDeltas, TradeTick},
     enums::{AggressorSide, BookAction, OrderSide, RecordFlag},
     identifiers::{InstrumentId, Symbol, TradeId},
-    instruments::{CurrencyPair, InstrumentAny},
+    instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
     types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
 use crate::{
-    common::parse::{instrument_id_from_lbank_symbol, split_base_quote},
-    http::models::{LBankAccuracy, LBankDepth, LBankLevel, LBankRestTrade},
+    common::parse::{
+        instrument_id_from_contract_symbol, instrument_id_from_lbank_symbol, split_base_quote,
+    },
+    http::models::{
+        LBankAccuracy, LBankContractInstrument, LBankDepth, LBankLevel, LBankRestTrade,
+    },
 };
 
 /// Parses a decimal string into a [`Price`] at the given precision.
@@ -243,10 +247,130 @@ pub fn parse_rest_trade_tick(
     )
 }
 
+/// Number of fractional digits in a simple decimal tick (e.g. `0.1` → 1, `0.0001` → 4, `1.0` → 0),
+/// or `None` if it needs more than the max `Price`/`Quantity` precision (9) — e.g. a `1e-10` meme-coin
+/// tick, which cannot be represented and would otherwise round to 0 and PANIC `Price::new`. LBank
+/// contract ticks are plain decimal fractions, so the shortest `f64` string is exact enough (Rust's
+/// `f64` Display never uses scientific notation).
+fn tick_precision(tick: f64) -> Option<u8> {
+    let s = format!("{tick}");
+    let decimals = s
+        .split('.')
+        .nth(1)
+        .map_or(0, |frac| frac.trim_end_matches('0').len());
+    (decimals <= 9).then_some(decimals as u8)
+}
+
+/// Builds a contract [`InstrumentAny::CryptoPerpetual`] (USDT-linear) from one
+/// `cfd/openApi/v1/pub/instrument` row. `priceTick`/`volumeTick` give the price/size precision and
+/// increments; the instrument's `price_increment` string (e.g. `"0.1"`) is later reused as the
+/// native price-group step for the OrderBook WS subscribe id.
+pub fn instrument_from_contract(
+    inst: &LBankContractInstrument,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    let instrument_id = instrument_id_from_contract_symbol(&inst.symbol);
+    let raw_symbol = Symbol::from(inst.symbol.as_str());
+    let base = inst
+        .base_currency
+        .as_deref()
+        .with_context(|| format!("missing baseCurrency for '{}'", inst.symbol))?;
+    let quote = inst
+        .price_currency
+        .as_deref()
+        .or(inst.clear_currency.as_deref())
+        .with_context(|| format!("missing quote currency for '{}'", inst.symbol))?;
+    let settle = inst.clear_currency.as_deref().unwrap_or(quote);
+
+    let base_currency = Currency::get_or_create_crypto(base);
+    let quote_currency = Currency::get_or_create_crypto(quote);
+    let settlement_currency = Currency::get_or_create_crypto(settle);
+
+    let price_tick = inst
+        .price_tick
+        .filter(|t| *t > 0.0)
+        .with_context(|| format!("missing/zero priceTick for '{}'", inst.symbol))?;
+    let volume_tick = inst
+        .volume_tick
+        .filter(|t| *t > 0.0)
+        .with_context(|| format!("missing/zero volumeTick for '{}'", inst.symbol))?;
+    let price_precision = tick_precision(price_tick)
+        .with_context(|| format!("priceTick {price_tick} exceeds max precision for '{}'", inst.symbol))?;
+    let size_precision = tick_precision(volume_tick)
+        .with_context(|| format!("volumeTick {volume_tick} exceeds max precision for '{}'", inst.symbol))?;
+    let price_increment = Price::new(price_tick, price_precision);
+    let size_increment = Quantity::new(volume_tick, size_precision);
+
+    let cp = CryptoPerpetual::new(
+        instrument_id,
+        raw_symbol,
+        base_currency,
+        quote_currency,
+        settlement_currency,
+        false, // is_inverse — USDT-margined linear
+        price_precision,
+        size_precision,
+        price_increment,
+        size_increment,
+        None, // multiplier
+        None, // lot_size
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_notional
+        None, // min_notional
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // tick_scheme
+        None, // info
+        ts_init, // ts_event
+        ts_init, // ts_init
+    );
+    Ok(InstrumentAny::CryptoPerpetual(cp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::http::models::FlexStr;
+
+    #[test]
+    fn tick_precision_cases() {
+        assert_eq!(tick_precision(0.1), Some(1));
+        assert_eq!(tick_precision(0.0001), Some(4));
+        assert_eq!(tick_precision(1.0), Some(0));
+        assert_eq!(tick_precision(10.0), Some(0));
+        assert_eq!(tick_precision(1e-9), Some(9));
+        assert_eq!(tick_precision(1e-10), None); // >9 decimals → skip (would panic Price::new)
+    }
+
+    #[test]
+    fn contract_instrument_btc() {
+        let inst = LBankContractInstrument {
+            symbol: "BTCUSDT".to_string(),
+            base_currency: Some("BTC".to_string()),
+            price_currency: Some("USDT".to_string()),
+            clear_currency: Some("USDT".to_string()),
+            price_tick: Some(0.1),
+            volume_tick: Some(0.0001),
+            volume_multiple: Some(1.0),
+            min_order_volume: Some(FlexStr("0.0001".into())),
+        };
+        let any = instrument_from_contract(&inst, UnixNanos::default()).unwrap();
+        match any {
+            InstrumentAny::CryptoPerpetual(cp) => {
+                assert_eq!(cp.id.to_string(), "BTCUSDT.LBANK");
+                assert_eq!(cp.price_precision, 1);
+                assert_eq!(cp.size_precision, 4);
+                assert_eq!(cp.price_increment.to_string(), "0.1");
+                assert_eq!(cp.base_currency.code.as_str(), "BTC");
+            }
+            _ => panic!("expected CryptoPerpetual"),
+        }
+    }
 
     #[test]
     fn aggressor_direction_mapping() {
