@@ -170,7 +170,6 @@ enum WorkerDispatch {
     Registered(TimeEventCallbackToken),
     #[cfg(feature = "python")]
     SenderlessPython(Arc<crate::timer::PythonTimeEventCallback>),
-    SenderlessRust,
 }
 
 impl LiveTimer {
@@ -262,6 +261,16 @@ impl LiveTimer {
     /// Panics if using a Rust callback (`Rust` or `RustLocal`) without a `TimeEventSender`.
     #[allow(unused_variables)]
     pub fn start(&mut self) {
+        if let OwnerCallback::Senderless(callback) = &self.callback {
+            match callback {
+                #[cfg(feature = "python")]
+                TimeEventCallback::Python(_) => {}
+                TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
+                    panic!("timer event sender was unset for Rust callback system");
+                }
+            }
+        }
+
         let event_name = self.name;
         let stop_time_ns = self.stop_time_ns;
         let interval_ns = self.interval_ns.get();
@@ -294,7 +303,7 @@ impl LiveTimer {
                     WorkerDispatch::SenderlessPython(callback.clone())
                 }
                 TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
-                    WorkerDispatch::SenderlessRust
+                    unreachable!("senderless Rust callback rejected at start")
                 }
             },
         };
@@ -402,9 +411,6 @@ impl LiveTimer {
                     }
                     #[cfg(feature = "python")]
                     (None, WorkerDispatch::SenderlessPython(callback)) => callback.call(event),
-                    (None, WorkerDispatch::SenderlessRust) => {
-                        panic!("timer event sender was unset for Rust callback system");
-                    }
                     _ => unreachable!("timer callback dispatch did not match its sender"),
                 }
 
@@ -579,35 +585,27 @@ mod tests {
     #[cfg(any(feature = "python", not(all(feature = "simulation", madsim))))]
     #[derive(Debug)]
     struct ChannelSender {
-        tx: Mutex<mpsc::Sender<TimeEventMessage>>,
+        tx: mpsc::Sender<TimeEventMessage>,
     }
 
     #[cfg(any(feature = "python", not(all(feature = "simulation", madsim))))]
     impl TimeEventSender for ChannelSender {
         fn send(&self, message: TimeEventMessage) {
-            self.tx
-                .lock()
-                .expect("sender mutex should lock")
-                .send(message)
-                .expect("message should send");
+            self.tx.send(message).expect("message should send");
         }
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]
     #[derive(Debug)]
     struct PausingChannelSender {
-        tx: Mutex<mpsc::Sender<TimeEventMessage>>,
+        tx: mpsc::Sender<TimeEventMessage>,
         release_rx: Mutex<mpsc::Receiver<()>>,
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]
     impl TimeEventSender for PausingChannelSender {
         fn send(&self, message: TimeEventMessage) {
-            self.tx
-                .lock()
-                .expect("sender mutex should lock")
-                .send(message)
-                .expect("message should send");
+            self.tx.send(message).expect("message should send");
             self.release_rx
                 .lock()
                 .expect("release mutex should lock")
@@ -846,11 +844,28 @@ mod tests {
         assert_eq!(timer.next_time_ns(), UnixNanos::from(1100));
     }
 
+    #[rstest]
+    #[should_panic(expected = "timer event sender was unset for Rust callback system")]
+    fn test_live_timer_start_panics_on_senderless_rust_callback() {
+        let now = get_atomic_clock_realtime().get_time_ns();
+        let mut timer = LiveTimer::new(
+            Ustr::from("SENDERLESS_RUST"),
+            NonZeroU64::new(1_000_000).unwrap(),
+            now,
+            None,
+            TimeEventCallback::from(|_| {}),
+            false,
+            None, // time_event_sender
+        );
+
+        timer.start();
+    }
+
     #[cfg(not(all(feature = "simulation", madsim)))]
     #[rstest]
     fn test_live_timer_uses_global_runtime() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let now = get_atomic_clock_realtime().get_time_ns();
         let mut timer = LiveTimer::new(
             Ustr::from("LIVE_TIMER"),
@@ -876,7 +891,7 @@ mod tests {
     #[rstest]
     fn test_live_timer_dispatches_rust_local_callback_on_owner_thread() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let count = Rc::new(std::cell::Cell::new(0));
         let callback_count = count.clone();
         let callback: Rc<dyn Fn(crate::timer::TimeEvent)> =
@@ -907,7 +922,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let sender = Arc::new(PausingChannelSender {
-            tx: Mutex::new(tx),
+            tx,
             release_rx: Mutex::new(release_rx),
         });
         let count = Rc::new(std::cell::Cell::new(0));
@@ -947,7 +962,7 @@ mod tests {
     #[rstest]
     fn test_live_timer_cancel_preserves_queued_direct_callback() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let count = Arc::new(AtomicUsize::new(0));
         let callback_count = count.clone();
         let now = get_atomic_clock_realtime().get_time_ns();
@@ -977,7 +992,7 @@ mod tests {
     #[rstest]
     fn test_live_timer_restart_after_cancel_re_registers_rust_local_callback() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let count = Rc::new(std::cell::Cell::new(0));
         let callback_count = count.clone();
         let callback: Rc<dyn Fn(crate::timer::TimeEvent)> =
@@ -1014,7 +1029,7 @@ mod tests {
     #[rstest]
     fn test_live_timer_start_while_active_restarts_and_keeps_dispatching() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let count = Rc::new(std::cell::Cell::new(0));
         let callback_count = count.clone();
         let callback: Rc<dyn Fn(crate::timer::TimeEvent)> =
@@ -1052,7 +1067,7 @@ mod tests {
     #[rstest]
     fn test_live_timer_stop_before_first_fire_sends_cleanup_message() {
         let (tx, rx) = mpsc::channel();
-        let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+        let sender = Arc::new(ChannelSender { tx });
         let count = Rc::new(std::cell::Cell::new(0));
         let callback_count = count.clone();
         let callback: Rc<dyn Fn(crate::timer::TimeEvent)> =
@@ -1123,7 +1138,7 @@ mod tests {
                 .unbind();
             let callback = TimeEventCallback::from(py_append);
             let (tx, rx) = mpsc::channel();
-            let sender = Arc::new(ChannelSender { tx: Mutex::new(tx) });
+            let sender = Arc::new(ChannelSender { tx });
             let now = get_atomic_clock_realtime().get_time_ns();
 
             let mut timer = LiveTimer::new(

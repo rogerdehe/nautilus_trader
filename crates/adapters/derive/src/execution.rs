@@ -25,7 +25,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use nautilus_common::{
     cache::ORDER_NOT_FOUND,
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::{
         ExecutionReport,
         execution::{
@@ -48,7 +48,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED, UUID4, UnixNanos,
+    AtomicMap, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
@@ -137,8 +137,8 @@ pub struct DeriveExecutionClient {
     signing: SigningContext,
     is_connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
+    ws_stream_handle: Option<JoinHandle<()>>,
     dispatch_state: Arc<WsDispatchState>,
 }
 
@@ -192,7 +192,7 @@ impl DeriveExecutionClient {
             credential.session_key(),
         )
         .context("failed to build Derive WebSocket credentials")?;
-        let ws_client = DeriveWebSocketClient::with_credentials(
+        let mut ws_client = DeriveWebSocketClient::with_credentials(
             Some(config.ws_url()),
             config.environment,
             config.transport_backend,
@@ -200,6 +200,10 @@ impl DeriveExecutionClient {
             ws_credentials,
             config.max_matching_requests_per_second,
         );
+
+        if let Some(secs) = config.ws_timeout_secs {
+            ws_client.set_request_timeout(Duration::from_secs(secs));
+        }
         // The handle shares the client's command channel, which survives the
         // reconnect swap, so it stays valid for the client's lifetime.
         let ws_exec = ws_client.execution_handle();
@@ -229,8 +233,8 @@ impl DeriveExecutionClient {
             signing,
             is_connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
-            pending_tasks: Mutex::new(Vec::new()),
-            ws_stream_handle: Mutex::new(None),
+            pending_tasks: TaskHandles::default(),
+            ws_stream_handle: None,
             dispatch_state: Arc::new(WsDispatchState::new()),
         })
     }
@@ -273,16 +277,11 @@ impl DeriveExecutionClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     async fn ensure_instruments_initialized(&self) -> anyhow::Result<()> {
@@ -353,7 +352,7 @@ impl DeriveExecutionClient {
     async fn teardown_partial_connect(&mut self) {
         self.cancellation_token.cancel();
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
 
@@ -363,7 +362,7 @@ impl DeriveExecutionClient {
         self.abort_pending_tasks();
     }
 
-    fn start_ws_dispatch(&self, rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
+    fn start_ws_dispatch(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
         let emitter = self.emitter.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
@@ -430,7 +429,7 @@ impl DeriveExecutionClient {
                 }
             }
         });
-        *self.ws_stream_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+        self.ws_stream_handle = Some(handle);
     }
 }
 
@@ -489,7 +488,7 @@ impl ExecutionClient for DeriveExecutionClient {
 
         self.cancellation_token.cancel();
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
         self.abort_pending_tasks();
@@ -581,7 +580,7 @@ impl ExecutionClient for DeriveExecutionClient {
             log::warn!("Error while disconnecting Derive execution WebSocket: {e}");
         }
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
         self.abort_pending_tasks();
@@ -761,19 +760,23 @@ impl ExecutionClient for DeriveExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.reconciliation_context()
-            .generate_position_status_reports(cmd)
-            .await
+        let snapshot = self
+            .reconciliation_context()
+            .generate_position_status_snapshot(cmd)
+            .await?;
+        Ok(snapshot.reports)
     }
 
     async fn generate_mass_status(
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        self.reconciliation_context()
-            .generate_mass_status(lookback_mins)
-            .await
-            .map(Some)
+        Box::pin(
+            self.reconciliation_context()
+                .generate_mass_status(lookback_mins),
+        )
+        .await
+        .map(Some)
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
@@ -1327,7 +1330,24 @@ impl ExecutionClient for DeriveExecutionClient {
                         client_order_id.as_str(),
                     ))
                     .await
-                    .map(|()| None),
+                    .map(|result| {
+                        if result.cancelled_orders == 0 {
+                            let reason = "no open order matched the client_order_id label";
+                            log::debug!(
+                                "Derive rejected cancel for {client_order_id}: {reason}"
+                            );
+                            let ts = clock.get_time_ns();
+                            emitter.emit_order_cancel_rejected_event(
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                None,
+                                reason,
+                                ts,
+                            );
+                        }
+                        None
+                    }),
             };
 
             match outcome {
@@ -1866,7 +1886,7 @@ impl DeriveReconciliationContext {
 
     async fn recover_after_reconnect(&self) -> anyhow::Result<()> {
         self.refresh_account_state().await?;
-        let mass_status = self.generate_mass_status(None).await?;
+        let mass_status = Box::pin(self.generate_mass_status(None)).await?;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
         let position_count = mass_status.position_reports().len();
@@ -2027,10 +2047,10 @@ impl DeriveReconciliationContext {
         Ok(reports)
     }
 
-    async fn generate_position_status_reports(
+    async fn generate_position_status_snapshot(
         &self,
         cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+    ) -> anyhow::Result<PositionStatusSnapshot> {
         let positions = self
             .http_client
             .get_positions(&DeriveGetPositionsParams::new(self.subaccount_id))
@@ -2038,22 +2058,26 @@ impl DeriveReconciliationContext {
             .positions;
         let ts_init = self.clock.get_time_ns();
         let mut reports = Vec::with_capacity(positions.len());
+        let mut instruments = AHashSet::with_capacity(positions.len());
         for position in positions {
+            let instrument_id = format_instrument_id(position.instrument_name.as_str());
             if let Some(target) = cmd.instrument_id
-                && InstrumentId::new(
-                    Symbol::new(position.instrument_name.as_str()),
-                    *DERIVE_VENUE,
-                ) != target
+                && instrument_id != target
             {
                 continue;
             }
+
+            instruments.insert(instrument_id);
 
             match parse_derive_position_to_report(&position, self.account_id, ts_init) {
                 Ok(report) => reports.push(report),
                 Err(e) => log::warn!("Skipping position in status report: {e}"),
             }
         }
-        Ok(reports)
+        Ok(PositionStatusSnapshot {
+            reports,
+            instruments,
+        })
     }
 
     async fn generate_mass_status(
@@ -2092,11 +2116,11 @@ impl DeriveReconciliationContext {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, None, None, None, None);
 
-        let (history_order_reports, open_order_reports, fill_reports, position_reports) = tokio::try_join!(
+        let (history_order_reports, open_order_reports, fill_reports, position_snapshot) = tokio::try_join!(
             self.generate_order_status_reports(&history_order_cmd),
             self.generate_order_status_reports(&open_order_cmd),
             self.generate_fill_reports(fill_cmd),
-            self.generate_position_status_reports(&position_cmd),
+            self.generate_position_status_snapshot(&position_cmd),
         )?;
         log::info!(
             "Received {} historical OrderStatusReports",
@@ -2107,7 +2131,10 @@ impl DeriveReconciliationContext {
             open_order_reports.len()
         );
         log::info!("Received {} FillReports", fill_reports.len());
-        log::info!("Received {} PositionReports", position_reports.len());
+        log::info!(
+            "Received {} PositionReports",
+            position_snapshot.reports.len()
+        );
 
         let mut touched_instruments = AHashSet::new();
 
@@ -2122,6 +2149,10 @@ impl DeriveReconciliationContext {
             touched_instruments.insert(report.instrument_id);
         }
 
+        let PositionStatusSnapshot {
+            reports: position_reports,
+            instruments: position_instruments,
+        } = position_snapshot;
         let mut mass_status =
             ExecutionMassStatus::new(self.client_id, self.account_id, *DERIVE_VENUE, ts_now, None);
         mass_status.add_order_reports(history_order_reports);
@@ -2132,10 +2163,16 @@ impl DeriveReconciliationContext {
             &mut mass_status,
             self.account_id,
             touched_instruments,
+            &position_instruments,
             ts_now,
         );
         Ok(mass_status)
     }
+}
+
+struct PositionStatusSnapshot {
+    reports: Vec<PositionStatusReport>,
+    instruments: AHashSet<InstrumentId>,
 }
 
 // Reason text and post-only classification for a definitive WS write failure.
@@ -2154,14 +2191,13 @@ fn add_missing_flat_position_reports(
     mass_status: &mut ExecutionMassStatus,
     account_id: AccountId,
     touched_instruments: AHashSet<InstrumentId>,
+    position_instruments: &AHashSet<InstrumentId>,
     ts_init: UnixNanos,
 ) {
-    let active_position_instruments: AHashSet<InstrumentId> =
-        mass_status.position_reports().keys().copied().collect();
     let mut flat_reports = Vec::new();
 
     for instrument_id in touched_instruments {
-        if active_position_instruments.contains(&instrument_id) {
+        if position_instruments.contains(&instrument_id) {
             continue;
         }
 

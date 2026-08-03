@@ -8,59 +8,27 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
-    "BYBIT_NAUTILUS_BROKER_ID",
-    "BybitAccountDetails",
-    "BybitAccountType",
-    "BybitApiKeyPermissions",
-    "BybitCancelType",
+    "BYBIT",
+    "BYBIT_CLIENT_ID",
+    "BYBIT_VENUE",
     "BybitDataClientConfig",
     "BybitDataClientFactory",
     "BybitEnvironment",
     "BybitExecClientConfig",
     "BybitExecutionClientFactory",
-    "BybitFeeRate",
-    "BybitHttpClient",
     "BybitMarginAction",
     "BybitMarginBorrowResult",
-    "BybitMarginMode",
     "BybitMarginRepayResult",
     "BybitMarginStatusResult",
-    "BybitNativeTpSlParams",
-    "BybitOpenOnly",
-    "BybitOrder",
-    "BybitOrderCursorList",
-    "BybitOrderFilter",
-    "BybitOrderSide",
-    "BybitOrderStatus",
-    "BybitOrderType",
     "BybitPositionIdx",
     "BybitPositionMode",
     "BybitProductType",
-    "BybitRawHttpClient",
-    "BybitServerTime",
-    "BybitStopOrderType",
     "BybitTickerData",
-    "BybitTickersParams",
-    "BybitTimeInForce",
-    "BybitTpSlMode",
-    "BybitTriggerDirection",
-    "BybitTriggerType",
-    "BybitWebSocketClient",
-    "BybitWebSocketError",
-    "BybitWsAmendOrderParams",
-    "BybitWsCancelOrderParams",
-    "BybitWsPlaceOrderParams",
-    "bybit_bar_spec_to_interval",
-    "bybit_extract_raw_symbol",
-    "bybit_make_hedge_venue_position_id",
-    "bybit_product_type_from_symbol",
-    "bybit_resolve_position_idx",
-    "get_bybit_http_base_url",
-    "get_bybit_ws_url_private",
-    "get_bybit_ws_url_public",
-    "get_bybit_ws_url_trade",
 ]
 
+BYBIT: str
+BYBIT_CLIENT_ID: model.ClientId
+BYBIT_VENUE: model.Venue
 BYBIT_NAUTILUS_BROKER_ID: str
 
 @typing.final
@@ -150,11 +118,15 @@ class BybitExecClientConfig:
     @property
     def heartbeat_interval_secs(self) -> int: ...
     @property
+    def auth_timeout_secs(self) -> int | None: ...
+    @property
     def recv_window_ms(self) -> int: ...
     @property
     def account_id(self) -> model.AccountId | None: ...
     @property
     def use_spot_position_reports(self) -> bool: ...
+    @property
+    def auto_repay_spot_borrows(self) -> bool: ...
     @property
     def margin_mode(self) -> BybitMarginMode | None: ...
     @property
@@ -174,9 +146,11 @@ class BybitExecClientConfig:
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
         heartbeat_interval_secs: int | None = None,
+        auth_timeout_secs: int | None = None,
         recv_window_ms: int | None = None,
         account_id: model.AccountId | None = None,
         use_spot_position_reports: bool | None = None,
+        auto_repay_spot_borrows: bool | None = None,
         margin_mode: BybitMarginMode | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
@@ -231,6 +205,9 @@ class BybitHttpClient:
     def get_spot_borrow_amount(self, coin: str) -> typing.Any: ...
     def borrow_spot(self, coin: str, amount: model.Quantity) -> typing.Any: ...
     def repay_spot_borrow(self, coin: str, amount: model.Quantity | None = None) -> typing.Any: ...
+    def repay_spot_borrow_with_conversion(
+        self, coin: str, amount: model.Quantity | None = None
+    ) -> typing.Any: ...
     def request_instruments(
         self,
         product_type: BybitProductType,

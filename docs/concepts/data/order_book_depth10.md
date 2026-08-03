@@ -1,22 +1,21 @@
 # OrderBookDepth10
 
-`OrderBookDepth10` represents a fixed-depth book update with up to 10 bid levels
-and 10 ask levels. It is useful when a venue publishes a self-contained depth
-snapshot rather than incremental deltas.
+`OrderBookDepth10` represents a fixed‑depth book update with up to 10 bid levels and 10 ask levels.
+Use it when a venue publishes a self‑contained depth snapshot rather than incremental deltas.
 
 ## Fields
 
-| Field           | Rust type          | Python type       | Required/default | Notes                                      |
-|-----------------|--------------------|-------------------|------------------|--------------------------------------------|
-| `instrument_id` | `InstrumentId`     | `InstrumentId`    | Required         | Instrument whose book is represented.      |
-| `bids`          | `[BookOrder; 10]`  | `list[BookOrder]` | Required         | Exactly 10 bid levels.                     |
-| `asks`          | `[BookOrder; 10]`  | `list[BookOrder]` | Required         | Exactly 10 ask levels.                     |
-| `bid_counts`    | `[u32; 10]`        | `list[int]`       | Required         | Number of bid orders at each level.        |
-| `ask_counts`    | `[u32; 10]`        | `list[int]`       | Required         | Number of ask orders at each level.        |
-| `flags`         | `u8`               | `int`             | Required         | `RecordFlag` bit field for event metadata. |
-| `sequence`      | `u64`              | `int`             | Required         | Venue sequence number, or zero if absent.  |
-| `ts_event`      | `UnixNanos`        | `int`             | Required         | Event timestamp in nanoseconds.            |
-| `ts_init`       | `UnixNanos`        | `int`             | Required         | Initialization timestamp in nanoseconds.   |
+| Field           | Rust type         | Python type       | Required/default | Notes                                      |
+| --------------- | ----------------- | ----------------- | ---------------- | ------------------------------------------ |
+| `instrument_id` | `InstrumentId`    | `InstrumentId`    | Required         | Instrument whose book is represented.      |
+| `bids`          | `[BookOrder; 10]` | `list[BookOrder]` | Required         | Exactly 10 bid levels.                     |
+| `asks`          | `[BookOrder; 10]` | `list[BookOrder]` | Required         | Exactly 10 ask levels.                     |
+| `bid_counts`    | `[u32; 10]`       | `list[int]`       | Required         | Number of bid orders at each level.        |
+| `ask_counts`    | `[u32; 10]`       | `list[int]`       | Required         | Number of ask orders at each level.        |
+| `flags`         | `u8`              | `int`             | Required         | `RecordFlag` bit field for event metadata. |
+| `sequence`      | `u64`             | `int`             | Required         | Venue sequence number, or zero if absent.  |
+| `ts_event`      | `UnixNanos`       | `int`             | Required         | Event timestamp in nanoseconds.            |
+| `ts_init`       | `UnixNanos`       | `int`             | Required         | Initialization timestamp in nanoseconds.   |
 
 ## Behavior
 
@@ -96,6 +95,6 @@ depth = OrderBookDepth10(
 
 ## Related guides
 
-- [QuoteTick](quote_tick.md) covers top-of-book data derived from depth.
+- [QuoteTick](quote_tick.md) covers top‑of‑book data derived from depth.
 - [Order books](index.md#order-books) explains order book state.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

@@ -9,7 +9,7 @@ This integration supports live market data ingest and order execution with AX Ex
 
 ## Examples
 
-You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/architect_ax/).
+You can find live example scripts in the [examples/live/architect_ax](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/architect_ax/) directory.
 
 ## Overview
 
@@ -42,15 +42,15 @@ NautilusTrader integration guide.
 
 The production catalog currently contains perpetual contracts across these venue categories:
 
-| Venue category   | Examples                         | Nautilus asset class |
-|------------------|----------------------------------|----------------------|
-| Foreign exchange | `EURUSD-PERP`, `JPYUSD-PERP`     | FX                   |
-| Equities         | `AAPL-PERP`, `NVDA-PERP`         | Equity               |
-| Energy ETFs      | `USO-PERP`, `UNG-PERP`           | Equity               |
-| Metals           | `XAU-PERP`, `XAG-PERP`           | Commodity            |
-| Energy           | `WTI-PERP`                       | Commodity            |
-| Treasuries       | `UST10Y-PERP`                    | Debt                 |
-| Compute          | `OCPI-H100-PERP`                 | Alternative          |
+| Venue category   | Examples                     | Nautilus asset class |
+| ---------------- | ---------------------------- | -------------------- |
+| Foreign exchange | `EURUSD-PERP`, `JPYUSD-PERP` | FX                   |
+| Equities         | `AAPL-PERP`, `NVDA-PERP`     | Equity               |
+| Energy ETFs      | `USO-PERP`, `UNG-PERP`       | Equity               |
+| Metals           | `XAU-PERP`, `XAG-PERP`       | Commodity            |
+| Energy           | `WTI-PERP`                   | Commodity            |
+| Treasuries       | `UST10Y-PERP`                | Debt                 |
+| Compute          | `OCPI-H100-PERP`             | Alternative          |
 
 The sandbox also lists dated gold contracts such as `XAU-2026-SEP` and `XAU-2026-DEC`.
 
@@ -80,11 +80,11 @@ asset class. The adapter uses `MARGIN` account type and `NETTING` order manageme
 The adapter preserves each AX symbol and appends the Nautilus venue identifier `.AX`. Perpetual
 symbols use the `-PERP` suffix. Dated symbols include their year and contract month.
 
-| Contract     | AX Symbol        | Nautilus InstrumentId |
-|--------------|------------------|-----------------------|
-| EUR/USD perp | `EURUSD-PERP`    | `EURUSD-PERP.AX`      |
-| Gold perp    | `XAU-PERP`       | `XAU-PERP.AX`         |
-| Dated gold   | `XAU-2026-SEP`   | `XAU-2026-SEP.AX`     |
+| Contract     | AX Symbol      | Nautilus InstrumentId |
+| ------------ | -------------- | --------------------- |
+| EUR/USD perp | `EURUSD-PERP`  | `EURUSD-PERP.AX`      |
+| Gold perp    | `XAU-PERP`     | `XAU-PERP.AX`         |
+| Dated gold   | `XAU-2026-SEP` | `XAU-2026-SEP.AX`     |
 
 The venue identifier is `AX`. To construct a Nautilus `InstrumentId`:
 
@@ -100,7 +100,7 @@ AX Exchange provides two trading environments. Configure the appropriate environ
 `environment` parameter in your client configuration.
 
 | Environment    | Config                                 | Description                            |
-|----------------|----------------------------------------|----------------------------------------|
+| -------------- | -------------------------------------- | -------------------------------------- |
 | **Sandbox**    | `environment=AxEnvironment.SANDBOX`    | Test environment with simulated funds. |
 | **Production** | `environment=AxEnvironment.PRODUCTION` | Live trading with real funds.          |
 
@@ -168,16 +168,16 @@ for historical data backfill.
 
 ### Data types
 
-| AX Data           | Nautilus Data Type   | Notes                                                              |
-|-------------------|----------------------|--------------------------------------------------------------------|
-| Order book (L1)   | `QuoteTick`          | Best bid/ask top‑of‑book from L1 book subscription.                |
-| Order book (L2)   | `OrderBookDelta`     | Aggregated price levels.                                           |
-| Order book (L3)   | `OrderBookDelta`     | Per‑snapshot order quantities with synthetic IDs.                  |
-| Trades            | `TradeTick`          | Real‑time trade events from trade‑only WebSocket subscription.     |
-| Mark price        | `MarkPriceUpdate`    | Extracted from L1 ticker subscription.                             |
-| Bars/candles      | `Bar`                | OHLCV data (total volume only, no buy/sell breakdown).             |
-| Funding rates     | `FundingRateUpdate`  | Polled via HTTP; interval configurable.                            |
-| Instrument status | `InstrumentStatus`   | State changes (open, halted, closed) from L1 ticker subscription.  |
+| AX Data           | Nautilus Data Type  | Notes                                                             |
+| ----------------- | ------------------- | ----------------------------------------------------------------- |
+| Order book (L1)   | `QuoteTick`         | Best bid/ask top‑of‑book from L1 book subscription.               |
+| Order book (L2)   | `OrderBookDelta`    | Aggregated price levels.                                          |
+| Order book (L3)   | `OrderBookDelta`    | Per‑snapshot order quantities with synthetic IDs.                 |
+| Trades            | `TradeTick`         | Real‑time trade events from trade‑only WebSocket subscription.    |
+| Mark price        | `MarkPriceUpdate`   | Extracted from L1 ticker subscription.                            |
+| Bars/candles      | `Bar`               | OHLCV data (total volume only, no buy/sell breakdown).            |
+| Funding rates     | `FundingRateUpdate` | Polled via HTTP; interval configurable.                           |
+| Instrument status | `InstrumentStatus`  | State changes (open, halted, closed) from L1 ticker subscription. |
 
 :::note
 Historical quote tick requests are not supported by AX Exchange. Only real-time quote
@@ -187,6 +187,13 @@ data is available via WebSocket L1 book subscriptions.
 :::note
 AX L3 snapshots contain per-order quantities but no venue order IDs. The adapter assigns synthetic
 IDs within each snapshot. It cannot track the same individual order across snapshots.
+:::
+
+:::note
+AX publishes no trade identifier for market data, so the adapter derives `TradeTick.trade_id` from the
+trade's own timestamp and content. REST and WebSocket agree on the same trade whenever both report its
+aggressor side. Prints that AX reports identically share an ID; only consumers that deduplicate market
+data on `trade_id` are affected, since fills carry the venue's own trade IDs.
 :::
 
 ### WebSocket subscription behavior
@@ -212,13 +219,18 @@ Nautilus data type.
 - `GET /tickers` returns limit/offset page metadata and supports `limit`, `offset`, and `sort`
   query parameters.
 - `GET /ticker` returns the ticker under a top-level `ticker` response field.
-- `GET /open-orders` uses limit/offset pagination. Reconciliation traverses all pages and validates
-  totals, offsets, duplicates, and completeness so detected response drift fails the request.
+- `GET /open-orders` uses limit/offset pagination. Open-order reconciliation traverses all pages
+  and validates totals, offsets, duplicates, and completeness so detected response drift fails the
+  request.
 - `GET /fills` and `GET /funding-rates` use cursor pagination. The adapter traverses each cursor
   chain as a best-effort historical read; AX corrections during traversal are not an atomic
   snapshot.
 - `GET /orders` exposes cursor metadata and supports `order_id`, `order_ids`, `account_id`, and
-  optional timestamp filters.
+  optional timestamp filters. Startup mass-status reconciliation traverses its cursor chain,
+  accepts partial pages, and rejects repeated cursors or duplicate order IDs.
+- Open-order, historical-order, fill, and position report requests resolve an uncached symbol
+  through `GET /instrument` and cache the result. An instrument request or parse failure fails that
+  entire report request instead of dropping venue state.
 - `GET /transactions` requires `start_timestamp_ns` and `end_timestamp_ns` with a range no wider
   than 7 days. The low-level client exposes its cursor and account selectors.
 - `GET /order-status` can include `reject_reason` and `reject_message` for rejected orders.
@@ -228,7 +240,7 @@ Nautilus data type.
 ### Bar intervals
 
 | Interval | Description |
-|----------|-------------|
+| -------- | ----------- |
 | `1s`     | 1-second    |
 | `5s`     | 5-second    |
 | `1m`     | 1-minute    |
@@ -255,23 +267,23 @@ configured trigger, then sends a plain limit order to this adapter.
 
 ### Nautilus order types
 
-| Order Type             | Supported | Notes                                             |
-|------------------------|-----------|---------------------------------------------------|
-| `MARKET`               | ✓         | Adapter‑simulated with an aggressive IOC price.   |
-| `LIMIT`                | ✓         | Maps to the native AX priced order shape.         |
-| `STOP_LIMIT`           | -         | *Not supported by AX Exchange*.                   |
-| `LIMIT_IF_TOUCHED`     | -         | *Not supported by AX Exchange*.                   |
-| `STOP_MARKET`          | -         | *Not supported by AX Exchange*.                   |
-| `MARKET_IF_TOUCHED`    | -         | *Not supported by AX Exchange*.                   |
-| `TRAILING_STOP_MARKET` | -         | *Not supported by AX Exchange*.                   |
+| Order Type             | Supported | Notes                                           |
+| ---------------------- | --------- | ----------------------------------------------- |
+| `MARKET`               | ✓         | Adapter‑simulated with an aggressive IOC price. |
+| `LIMIT`                | ✓         | Maps to the native AX priced order shape.       |
+| `STOP_LIMIT`           | -         | *Not supported by AX Exchange*.                 |
+| `LIMIT_IF_TOUCHED`     | -         | *Not supported by AX Exchange*.                 |
+| `STOP_MARKET`          | -         | *Not supported by AX Exchange*.                 |
+| `MARKET_IF_TOUCHED`    | -         | *Not supported by AX Exchange*.                 |
+| `TRAILING_STOP_MARKET` | -         | *Not supported by AX Exchange*.                 |
 
 ### Execution instructions
 
-| Instruction      | Supported | Notes                                                        |
-|------------------|-----------|--------------------------------------------------------------|
-| `post_only`      | ✓         | Maker‑only; rejected if the order would take.                |
-| `reduce_only`    | -         | Rejected locally; AX exposes no reduce‑only field.           |
-| `quote_quantity` | -         | Rejected locally; the adapter wire path encodes base only.   |
+| Instruction      | Supported | Notes                                                         |
+| ---------------- | --------- | ------------------------------------------------------------- |
+| `post_only`      | ✓         | Maker‑only; rejected if the order would take.                 |
+| `reduce_only`    | -         | Rejected locally; AX exposes no reduce‑only field.            |
+| `quote_quantity` | -         | Rejected locally; the adapter wire path encodes base only.    |
 | `display_qty`    | -         | Rejected locally; the adapter wire path has no display field. |
 
 A sandbox test on 2026-07-18 confirmed why this boundary is required. AX accepted and filled a
@@ -286,7 +298,7 @@ rejects equivalent venue-native features.
 ### Time in force
 
 | Time in Force  | Supported | Notes                            |
-|----------------|-----------|----------------------------------|
+| -------------- | --------- | -------------------------------- |
 | `GTC`          | ✓         | Good Till Canceled.              |
 | `GTD`          | -         | Rejected locally by the adapter. |
 | `DAY`          | ✓         | Valid until end of trading day.  |
@@ -299,36 +311,37 @@ The venue deprecates `DAY` and recommends `GTC` instead.
 
 ### Advanced order features
 
-| Feature            | Supported | Notes                                                               |
-|--------------------|-----------|---------------------------------------------------------------------|
-| Order modification | ✓         | Rust client only; the Python client rejects modification requests.  |
-| Cancel order       | ✓         | Single order cancellation.                                          |
-| Cancel all orders  | ✓         | Cancel all open orders for an instrument.                           |
-| Batch cancel       | -         | The adapter sends individual cancels.                               |
-| Order lists        | ✓         | Sequential submission (orders submitted individually, non‑atomic).  |
+| Feature            | Supported | Notes                                                              |
+| ------------------ | --------- | ------------------------------------------------------------------ |
+| Order modification | ✓         | Rust client only; the Python client rejects modification requests. |
+| Cancel order       | ✓         | Single order cancellation.                                         |
+| Cancel all orders  | ✓         | Cancel all open orders for an instrument.                          |
+| Batch cancel       | -         | The adapter sends individual cancels.                              |
+| Order lists        | ✓         | Sequential submission (orders submitted individually, non‑atomic). |
 
 ### Position management
 
-| Feature          | Supported | Notes                                |
-|------------------|-----------|--------------------------------------|
-| Query positions  | ✓         | Real‑time position updates.          |
-| Position mode    | -         | Netting mode only.                   |
-| Cross margin     | ✓         | Cross‑margin across all instruments. |
+| Feature         | Supported | Notes                                |
+| --------------- | --------- | ------------------------------------ |
+| Query positions | ✓         | Real‑time position updates.          |
+| Position mode   | -         | Netting mode only.                   |
+| Cross margin    | ✓         | Cross‑margin across all instruments. |
 
 ### Order querying
 
 | Feature              | Supported | Notes                                                   |
-|----------------------|-----------|---------------------------------------------------------|
+| -------------------- | --------- | ------------------------------------------------------- |
 | Query open orders    | ✓         | List all active orders.                                 |
 | Query single order   | ✓         | By venue order ID or client order ID (any order state). |
-| Order status reports | ✓         | Reconciliation from open orders; see note below.        |
+| Order status reports | ✓         | Open‑order checks and historical startup mass status.   |
 | Fill reports         | ✓         | Execution and fill history.                             |
 
 :::note
-Order status reports for reconciliation are generated from the open orders endpoint.
-Filled or canceled orders are not included in the reconciliation snapshot. Single-order
-queries via `query_order` use the dedicated `/order-status` endpoint which works for
-any order state.
+Bulk open-order checks use `/open-orders` when `open_check_open_only` is enabled, which is the
+default. Otherwise, they use `/orders`. Startup mass-status reconciliation uses `/orders`, so its
+snapshot includes historical terminal orders such as filled and canceled orders. Single-order
+queries via `query_order` use the dedicated `/order-status` endpoint, which works for any order
+state.
 
 AX open and historical order payloads do not expose a stop order type or trigger price.
 REST-derived reconciliation therefore reports every visible external order as a limit order. The
@@ -350,7 +363,7 @@ AX Exchange uses bearer token authentication:
 ### Environments and endpoints
 
 | Environment | HTTP API (market data)                           | HTTP API (orders)                                   | Market Data WS                                   | Orders WS                                            |
-|-------------|--------------------------------------------------|-----------------------------------------------------|--------------------------------------------------|------------------------------------------------------|
+| ----------- | ------------------------------------------------ | --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- |
 | Sandbox     | `https://gateway.sandbox.architect.exchange/api` | `https://gateway.sandbox.architect.exchange/orders` | `wss://gateway.sandbox.architect.exchange/md/ws` | `wss://gateway.sandbox.architect.exchange/orders/ws` |
 | Production  | `https://gateway.architect.exchange/api`         | `https://gateway.architect.exchange/orders`         | `wss://gateway.architect.exchange/md/ws`         | `wss://gateway.architect.exchange/orders/ws`         |
 
@@ -362,7 +375,7 @@ from market data endpoints. This is handled automatically by the adapter configu
 ### Data client configuration options
 
 | Option                             | Default   | Description                                                         |
-|------------------------------------|-----------|---------------------------------------------------------------------|
+| ---------------------------------- | --------- | ------------------------------------------------------------------- |
 | `api_key`                          | `None`    | API key; loaded from `AX_API_KEY` env var when omitted.             |
 | `api_secret`                       | `None`    | API secret; loaded from `AX_API_SECRET` env var when omitted.       |
 | `environment`                      | `SANDBOX` | Trading environment (`SANDBOX` or `PRODUCTION`).                    |
@@ -381,7 +394,7 @@ from market data endpoints. This is handled automatically by the adapter configu
 ### Execution client configuration options
 
 | Option                    | Default   | Description                                                         |
-|---------------------------|-----------|---------------------------------------------------------------------|
+| ------------------------- | --------- | ------------------------------------------------------------------- |
 | `api_key`                 | `None`    | API key; loaded from `AX_API_KEY` env var when omitted.             |
 | `api_secret`              | `None`    | API secret; loaded from `AX_API_SECRET` env var when omitted.       |
 | `environment`             | `SANDBOX` | Trading environment (`SANDBOX` or `PRODUCTION`).                    |
@@ -483,6 +496,10 @@ credentials are valid and have trading permissions.
   modification requests; cancel and resubmit instead.
 - **Cancel on disconnect**: Set `cancel_on_disconnect=True` in the execution client config
   to have the exchange cancel all open orders if the orders WebSocket disconnects.
+- **Instrument fee rates**: AX reports maker and taker rates per account on `GET /whoami`, so the
+  adapter resolves them after authenticating and applies them to every instrument. The execution
+  client fails to connect if that lookup fails, rather than reporting zero fees for the process
+  lifetime. A data client configured without credentials cannot read the rates and reports zero fees.
 - **Fill commissions**: Real-time fill events from the WebSocket do not include fee data.
   Commission is reported as zero for streaming fills. During reconciliation, the REST
   `/fills` endpoint provides accurate fee information.

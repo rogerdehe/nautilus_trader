@@ -13,7 +13,7 @@ Transition: `PENDING_UPDATE` -> previous status (for example `ACCEPTED`). Handle
 Beyond the [common order event fields](index.md#common-order-event-fields), `OrderUpdated` carries:
 
 | Field               | Python type       | Required/default | Description                                                 |
-|---------------------|-------------------|------------------|-------------------------------------------------------------|
+| ------------------- | ----------------- | ---------------- | ----------------------------------------------------------- |
 | `quantity`          | `Quantity`        | Required         | The order's current quantity.                               |
 | `price`             | `Price` or `None` | Required         | The order's current price.                                  |
 | `trigger_price`     | `Price` or `None` | Required         | The order's current trigger price.                          |
@@ -29,8 +29,7 @@ Reading the event in a strategy handler:
 ```python
 def on_order_updated(self, event: OrderUpdated) -> None:
     self.log.info(
-        f"Order {event.client_order_id} updated: "
-        f"qty={event.quantity} price={event.price}",
+        f"Order {event.client_order_id} updated: qty={event.quantity} price={event.price}",
     )
 ```
 

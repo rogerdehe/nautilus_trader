@@ -9,14 +9,20 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
+    "AX",
+    "AX_CLIENT_ID",
+    "AX_VENUE",
     "AxDataClientConfig",
+    "AxDataClientFactory",
     "AxEnvironment",
     "AxExecClientConfig",
-    "AxHttpClient",
+    "AxExecutionClientFactory",
     "AxMarketDataLevel",
-    "AxMdWebSocketClient",
-    "AxOrdersWebSocketClient",
 ]
+
+AX: str
+AX_CLIENT_ID: model.ClientId
+AX_VENUE: model.Venue
 
 @typing.final
 class AxDataClientConfig:
@@ -67,6 +73,11 @@ class AxDataClientConfig:
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...
+
+@typing.final
+class AxDataClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...
 
 @typing.final
 class AxExecClientConfig:
@@ -120,6 +131,11 @@ class AxExecClientConfig:
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...
+
+@typing.final
+class AxExecutionClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...
 
 @typing.final
 class AxHttpClient:

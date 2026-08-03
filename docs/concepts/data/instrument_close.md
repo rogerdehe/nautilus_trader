@@ -1,12 +1,12 @@
 # InstrumentClose
 
-`InstrumentClose` represents a closing price event for an instrument at a venue.
-It is used for end-of-session closes and contract-expiry close events.
+`InstrumentClose` represents a closing price event for an instrument at a venue. It covers
+end‑of‑session closes and contract‑expiry close events.
 
 ## Fields
 
 | Field           | Rust type             | Python type           | Required/default | Notes                                    |
-|-----------------|-----------------------|-----------------------|------------------|------------------------------------------|
+| --------------- | --------------------- | --------------------- | ---------------- | ---------------------------------------- |
 | `instrument_id` | `InstrumentId`        | `InstrumentId`        | Required         | Instrument being closed.                 |
 | `close_price`   | `Price`               | `Price`               | Required         | Closing or settlement price.             |
 | `close_type`    | `InstrumentCloseType` | `InstrumentCloseType` | Required         | `END_OF_SESSION` or `CONTRACT_EXPIRED`.  |
@@ -15,8 +15,8 @@ It is used for end-of-session closes and contract-expiry close events.
 
 ## Behavior
 
-- End-of-session closes provide session-level close prices.
-- Contract-expiry closes mark expiration events for dated contracts.
+- End‑of‑session closes provide session‑level close prices.
+- Contract‑expiry closes mark expiration events for dated contracts.
 - The close price is reference data; it does not imply a trade occurred at that price.
 
 ## Example
@@ -58,4 +58,4 @@ close = InstrumentClose(
 
 - [InstrumentStatus](instrument_status.md) covers instrument status events.
 - [Instruments](../instruments/) covers instrument definitions.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

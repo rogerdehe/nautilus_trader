@@ -1,19 +1,18 @@
 # FundingRateUpdate
 
-`FundingRateUpdate` represents the current funding rate for a perpetual swap
-instrument. It can also include the funding interval and the next funding timestamp
-when the venue publishes them.
+`FundingRateUpdate` represents the funding rate for a perpetual swap instrument. It can also include
+the funding interval and next funding timestamp when the venue publishes them.
 
 ## Fields
 
-| Field             | Rust type             | Python type      | Required/default | Notes                                    |
-|-------------------|-----------------------|------------------|------------------|------------------------------------------|
-| `instrument_id`   | `InstrumentId`        | `InstrumentId`   | Required         | Perpetual instrument for the rate.       |
-| `rate`            | `Decimal`             | `Decimal`        | Required         | Current funding rate.                    |
-| `interval`        | `Option<u16>`         | `int \| None`    | `None`           | Funding interval in minutes.             |
-| `next_funding_ns` | `Option<UnixNanos>`   | `int \| None`    | `None`           | Next funding timestamp in nanoseconds.   |
-| `ts_event`        | `UnixNanos`           | `int`            | Required         | Event timestamp in nanoseconds.          |
-| `ts_init`         | `UnixNanos`           | `int`            | Required         | Initialization timestamp in nanoseconds. |
+| Field             | Rust type           | Python type    | Required/default | Notes                                    |
+| ----------------- | ------------------- | -------------- | ---------------- | ---------------------------------------- |
+| `instrument_id`   | `InstrumentId`      | `InstrumentId` | Required         | Perpetual instrument for the rate.       |
+| `rate`            | `Decimal`           | `Decimal`      | Required         | Current funding rate.                    |
+| `interval`        | `Option<u16>`       | `int \| None`  | `None`           | Funding interval in minutes.             |
+| `next_funding_ns` | `Option<UnixNanos>` | `int \| None`  | `None`           | Next funding timestamp in nanoseconds.   |
+| `ts_event`        | `UnixNanos`         | `int`          | Required         | Event timestamp in nanoseconds.          |
+| `ts_init`         | `UnixNanos`         | `int`          | Required         | Initialization timestamp in nanoseconds. |
 
 ## Behavior
 
@@ -58,4 +57,4 @@ funding = FundingRateUpdate(
 
 - [MarkPriceUpdate](mark_price_update.md) covers mark prices for derivatives.
 - [IndexPriceUpdate](index_price_update.md) covers index reference prices.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

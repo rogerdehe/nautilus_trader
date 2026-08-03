@@ -1,12 +1,12 @@
 # TradeTick
 
-`TradeTick` represents one executed trade or match event from a venue. It carries
-the traded price, traded size, aggressor side, and venue trade identifier.
+`TradeTick` represents one executed trade or match event from a venue. It carries the traded price,
+size, aggressor side, and venue trade identifier.
 
 ## Fields
 
 | Field            | Rust type       | Python type     | Required/default | Notes                                    |
-|------------------|-----------------|-----------------|------------------|------------------------------------------|
+| ---------------- | --------------- | --------------- | ---------------- | ---------------------------------------- |
 | `instrument_id`  | `InstrumentId`  | `InstrumentId`  | Required         | Instrument for the trade.                |
 | `price`          | `Price`         | `Price`         | Required         | Executed price.                          |
 | `size`           | `Quantity`      | `Quantity`      | Required         | Executed quantity.                       |
@@ -18,7 +18,7 @@ the traded price, traded size, aggressor side, and venue trade identifier.
 ## Behavior
 
 - `size` must be positive.
-- Information-driven bars require `TradeTick` data because they use `aggressor_side`.
+- Information‑driven bars require `TradeTick` data because they use `aggressor_side`.
 - Trade bars use `LAST` price type.
 - `trade_id` should be stable for the venue event when the venue provides one.
 
@@ -65,6 +65,6 @@ trade = TradeTick(
 
 ## Related guides
 
-- [Bar](bar.md) covers trade-to-bar aggregation.
-- [Information-driven bars](index.md#information-driven-bars) explains aggressor-side use.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Bar](bar.md) covers trade‑to‑bar aggregation.
+- [Information‑driven bars](index.md#information-driven-bars) explains aggressor‑side use.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

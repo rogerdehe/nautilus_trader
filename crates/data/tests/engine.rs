@@ -81,6 +81,8 @@ use nautilus_model::defi::{
     data::block::BlockPosition,
     pool_analysis::snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
 };
+#[cfg(feature = "defi")]
+use nautilus_model::enums::CurrencyType;
 #[cfg(feature = "streaming")]
 use nautilus_model::enums::{BookAction, OrderSide};
 use nautilus_model::{
@@ -115,6 +117,8 @@ use nautilus_persistence::test_data::RustTestCustomData;
 #[cfg(feature = "streaming")]
 use nautilus_serialization::ensure_custom_data_registered;
 use rstest::*;
+#[cfg(feature = "defi")]
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use ustr::Ustr;
 
@@ -11715,6 +11719,142 @@ fn test_pool_updater_processes_flash_updates_profiler(
 
 #[cfg(feature = "defi")]
 #[rstest]
+fn test_process_defi_pools_publishes_distinct_tradable_instruments(
+    data_engine: Rc<RefCell<DataEngine>>,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+) {
+    let _ = stub_msgbus;
+    let chain = Arc::new(chains::ARBITRUM.clone());
+    let dex = Arc::new(Dex::new(
+        chains::ARBITRUM.clone(),
+        DexType::UniswapV3,
+        "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        0,
+        AmmType::CLAMM,
+        "PoolCreated",
+        "Swap",
+        "Mint",
+        "Burn",
+        "Collect",
+    ));
+    let token0 = Token::new(
+        chain.clone(),
+        Address::from([0x11; 20]),
+        "Base token".to_string(),
+        "BASE".to_string(),
+        8,
+    );
+    let token1 = Token::new(
+        chain.clone(),
+        Address::from([0x22; 20]),
+        "Quote token".to_string(),
+        "QUOTE".to_string(),
+        6,
+    );
+    let address_a = Address::from([0xAA; 20]);
+    let address_b = Address::from([0xBB; 20]);
+    let address_invalid = Address::from([0xCC; 20]);
+    let pool_a = Pool::new(
+        chain.clone(),
+        dex.clone(),
+        address_a,
+        PoolIdentifier::from_address(address_a),
+        1,
+        token0.clone(),
+        token1.clone(),
+        Some(500),
+        Some(10),
+        UnixNanos::from(1),
+    );
+    let pool_b = Pool::new(
+        chain.clone(),
+        dex.clone(),
+        address_b,
+        PoolIdentifier::from_address(address_b),
+        2,
+        token0.clone(),
+        token1.clone(),
+        Some(3_000),
+        Some(60),
+        UnixNanos::from(2),
+    );
+    let mut pool_invalid = Pool::new(
+        chain,
+        dex,
+        address_invalid,
+        PoolIdentifier::from_address(address_invalid),
+        3,
+        token0,
+        token1,
+        Some(10_000),
+        Some(200),
+        UnixNanos::from(3),
+    );
+    pool_invalid.token0.symbol.clear();
+    let id_a = pool_a.instrument_id;
+    let id_b = pool_b.instrument_id;
+    let id_invalid = pool_invalid.instrument_id;
+    let expected_invalid = pool_invalid.clone();
+    let venue = id_a.venue;
+    let expected = |pool: &Pool| {
+        InstrumentAny::CurrencyPair(CurrencyPair::new(
+            pool.instrument_id,
+            pool.instrument_id.symbol,
+            Currency::new("BASE", 8, 0, "Base token", CurrencyType::Crypto),
+            Currency::new("QUOTE", 6, 0, "Quote token", CurrencyType::Crypto),
+            6,
+            8,
+            Price::from("0.000001"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            pool.fee.map(|fee| Decimal::new(i64::from(fee), 6)),
+            None,
+            None,
+            pool.ts_event,
+            pool.ts_init,
+        ))
+    };
+    let expected_a = expected(&pool_a);
+    let expected_b = expected(&pool_b);
+    let (handler, saving_handler) =
+        msgbus::stubs::get_typed_message_saving_handler::<InstrumentAny>(None);
+    msgbus::subscribe_instruments(switchboard::get_instruments_pattern(venue), handler, None);
+
+    {
+        let mut engine = data_engine.borrow_mut();
+        engine.process_defi_data(DefiData::Pool(pool_a));
+        engine.process_defi_data(DefiData::Pool(pool_b));
+        engine.process_defi_data(DefiData::Pool(pool_invalid));
+    }
+
+    let cache = data_engine.borrow().cache_rc();
+    let cache = cache.borrow();
+    let messages = saving_handler.get_messages();
+    let selected = cache.instrument(&id_b);
+
+    assert_ne!(id_a, id_b);
+    assert_eq!(cache.instrument(&id_a), Some(&expected_a));
+    assert_eq!(selected, Some(&expected_b));
+    assert_eq!(cache.pool(&id_invalid), Some(&expected_invalid));
+    assert_eq!(cache.instrument(&id_invalid), None);
+    assert_eq!(cache.instruments(&venue, None).len(), 2);
+    assert_eq!(messages.len(), 2);
+    assert!(messages.contains(&expected_a));
+    assert!(messages.contains(&expected_b));
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
 fn test_execute_defi_request_pool_snapshot(
     data_engine: Rc<RefCell<DataEngine>>,
     clock: Rc<RefCell<TestClock>>,
@@ -17464,7 +17604,6 @@ fn test_request_join_two_phase_emits_parent_response(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
-    let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
@@ -17543,6 +17682,49 @@ fn test_request_join_two_phase_emits_parent_response(
         .copied()
         .expect("joined quote data must reach the cache");
     assert_eq!(cached.ts_init, UnixNanos::from(2_000));
+
+    for request_id in [leg_a, leg_b, join_id] {
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&request_id)
+                .is_none(),
+            "completed join response handler must be removed for {request_id}",
+        );
+    }
+
+    data_engine.response(leg_quotes_response(
+        leg_a,
+        instrument_id,
+        client_id,
+        vec![pipeline_quote(instrument_id, 3_000)],
+        None,
+        None,
+    ));
+    data_engine.response(leg_quotes_response(
+        leg_b,
+        instrument_id,
+        client_id,
+        vec![pipeline_quote(instrument_id, 4_000)],
+        None,
+        None,
+    ));
+    data_engine.response(leg_quotes_response(
+        join_id,
+        instrument_id,
+        client_id,
+        vec![pipeline_quote(instrument_id, 5_000)],
+        None,
+        None,
+    ));
+
+    assert_eq!(
+        parent_saver.get_messages().len(),
+        1,
+        "late leg and parent responses must not complete the join again",
+    );
+    assert_eq!(leg_a_saver.get_messages().len(), 1);
+    assert_eq!(leg_b_saver.get_messages().len(), 1);
 }
 
 #[rstest]
@@ -17950,7 +18132,6 @@ fn test_reset_clears_pipeline_and_join_state(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
-    let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
@@ -17979,11 +18160,24 @@ fn test_reset_clears_pipeline_and_join_state(
     let (parent_handler, parent_saver) =
         get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-parent")));
     msgbus::register_response_handler(&join_id, parent_handler);
+    let (leg_b_handler, leg_b_saver) =
+        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-leg-b")));
+    msgbus::register_response_handler(&leg_b, leg_b_handler);
 
     data_engine.reset();
 
     assert_eq!(data_engine.request_pipeline_count(), 0);
     assert_eq!(data_engine.pending_join_request_count(), 0);
+
+    for request_id in [leg_b, join_id] {
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&request_id)
+                .is_some(),
+            "data engine reset must not clear message bus response handlers for {request_id}",
+        );
+    }
 
     data_engine.response(leg_quotes_response(
         leg_a,
@@ -18002,9 +18196,37 @@ fn test_reset_clears_pipeline_and_join_state(
         None,
     ));
 
+    assert_eq!(leg_b_saver.get_messages().len(), 1);
+    assert_eq!(leg_b_saver.get_messages()[0].correlation_id, leg_b);
+    assert!(
+        stub_msgbus.borrow().get_response_handler(&leg_b).is_none(),
+        "the first late leg response must consume its handler",
+    );
+
+    data_engine.response(leg_quotes_response(
+        leg_b,
+        instrument_id,
+        client_id,
+        vec![pipeline_quote(instrument_id, 3_000)],
+        None,
+        None,
+    ));
+
+    assert_eq!(
+        leg_b_saver.get_messages().len(),
+        1,
+        "a duplicate late leg response must not invoke the handler again",
+    );
     assert!(
         parent_saver.get_messages().is_empty(),
         "reset must clear pipeline state so no rebuilt parent fires",
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&join_id)
+            .is_some(),
+        "reset must not clear unrelated message bus response handlers",
     );
 }
 
@@ -18277,7 +18499,6 @@ fn test_request_join_single_leg_fires_immediately(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
-    let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
@@ -18332,6 +18553,16 @@ fn test_request_join_single_leg_fires_immediately(
 
     assert_eq!(data_engine.request_pipeline_count(), 0);
     assert_eq!(data_engine.pending_join_request_count(), 0);
+
+    for request_id in [leg, join_id] {
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&request_id)
+                .is_none(),
+            "completed single-leg join handler must be removed for {request_id}",
+        );
+    }
 }
 
 #[rstest]

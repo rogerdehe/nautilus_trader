@@ -26,21 +26,22 @@
 //! objects.
 //!
 //! Alternative implementations can be written on top of the generic engine - which
-//! just need to override the `execute`, `process`, `send` and `receive` methods.
+//! just need to override the `execute`, `process`, `send`, and `receive` methods.
 
 pub mod bar;
 pub mod book;
-mod commands;
 pub mod config;
-mod handlers;
-mod requests;
-mod time_range;
 
 #[cfg(feature = "defi")]
 pub mod pool;
 
 #[cfg(feature = "streaming")]
 mod streaming;
+
+mod commands;
+mod handlers;
+mod requests;
+mod time_range;
 
 use std::{
     any::{Any, type_name},
@@ -2386,7 +2387,7 @@ impl DataEngine {
         !self.config.disable_historical_cache
     }
 
-    fn handle_instrument(&mut self, instrument: &InstrumentAny) {
+    pub(crate) fn handle_instrument(&mut self, instrument: &InstrumentAny) {
         log::debug!("Handling instrument: {}", instrument.id());
 
         if let Err(e) = self

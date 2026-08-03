@@ -1,23 +1,23 @@
 # OptionGreeks
 
-`OptionGreeks` represents venue-provided option sensitivities and implied volatility
-for one option instrument. It is a native `Data` enum variant and can be recorded,
-replayed, and queried through the catalog.
+`OptionGreeks` represents venue‑provided option sensitivities and implied volatility for one option
+instrument. As a native `Data` enum variant, it can be recorded, replayed, and queried through the
+catalog.
 
 ## Fields
 
-| Field              | Rust type             | Python type      | Required/default | Notes                                      |
-|--------------------|-----------------------|------------------|------------------|--------------------------------------------|
-| `instrument_id`    | `InstrumentId`        | `InstrumentId`   | Required         | Option instrument for the Greeks.          |
-| `convention`       | `GreeksConvention`    | `GreeksConvention` | Default        | Numeraire convention for the values.       |
-| `greeks`           | `OptionGreekValues`   | Separate floats  | Required         | Delta, gamma, vega, theta, and rho.        |
-| `mark_iv`          | `Option<f64>`         | `float \| None`  | `None`           | Mark implied volatility.                   |
-| `bid_iv`           | `Option<f64>`         | `float \| None`  | `None`           | Bid implied volatility.                    |
-| `ask_iv`           | `Option<f64>`         | `float \| None`  | `None`           | Ask implied volatility.                    |
-| `underlying_price` | `Option<f64>`         | `float \| None`  | `None`           | Underlying price used for the calculation. |
-| `open_interest`    | `Option<f64>`         | `float \| None`  | `None`           | Open interest when published.              |
-| `ts_event`         | `UnixNanos`           | `int`            | Required         | Event timestamp in nanoseconds.            |
-| `ts_init`          | `UnixNanos`           | `int`            | Required         | Initialization timestamp in nanoseconds.   |
+| Field              | Rust type           | Python type        | Required/default | Notes                                      |
+| ------------------ | ------------------- | ------------------ | ---------------- | ------------------------------------------ |
+| `instrument_id`    | `InstrumentId`      | `InstrumentId`     | Required         | Option instrument for the Greeks.          |
+| `convention`       | `GreeksConvention`  | `GreeksConvention` | Default          | Numeraire convention for the values.       |
+| `greeks`           | `OptionGreekValues` | Separate floats    | Required         | Delta, gamma, vega, theta, and rho.        |
+| `mark_iv`          | `Option<f64>`       | `float \| None`    | `None`           | Mark implied volatility.                   |
+| `bid_iv`           | `Option<f64>`       | `float \| None`    | `None`           | Bid implied volatility.                    |
+| `ask_iv`           | `Option<f64>`       | `float \| None`    | `None`           | Ask implied volatility.                    |
+| `underlying_price` | `Option<f64>`       | `float \| None`    | `None`           | Underlying price used for the calculation. |
+| `open_interest`    | `Option<f64>`       | `float \| None`    | `None`           | Open interest when published.              |
+| `ts_event`         | `UnixNanos`         | `int`              | Required         | Event timestamp in nanoseconds.            |
+| `ts_init`          | `UnixNanos`         | `int`              | Required         | Initialization timestamp in nanoseconds.   |
 
 ## Behavior
 
@@ -25,7 +25,7 @@ replayed, and queried through the catalog.
 - The Python constructor accepts `delta`, `gamma`, `vega`, `theta`, and optional `rho`
   as separate float arguments.
 - Option chain subscriptions use `underlying_price` and deltas to resolve ATM and
-  delta-based strike windows.
+  delta‑based strike windows.
 
 ## Example
 
@@ -80,6 +80,6 @@ greeks = OptionGreeks(
 
 ## Related guides
 
-- [Greeks](../greeks.md) covers venue-provided and locally computed Greeks.
+- [Greeks](../greeks.md) covers venue‑provided and locally computed Greeks.
 - [Options](../options.md#optiongreeks-data-type) covers option chain subscriptions.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

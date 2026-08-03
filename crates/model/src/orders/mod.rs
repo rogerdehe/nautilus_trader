@@ -14,10 +14,20 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Order types for the trading domain model.
+//!
+//! Each order type wraps an [`OrderCore`] carrying the state common to all of them and adds its
+//! own type-specific fields. [`OrderAny`] dispatches over the concrete types.
+//!
+//! Orders are event sourced. [`OrderCore::apply`] validates the status transition, runs the
+//! handler for that event, then appends it, so [`OrderAny::from_events`] replays a stream to
+//! reconstruct its event-derived state.
+//!
+//! A fill-void correction rebuilds the derived fill state from the fills that survive it.
+//! `avg_px` folds those fills in `Decimal` and keeps the quotient at that precision, so no float
+//! conversion enters the next average and a rebuild agrees with the incremental update over the
+//! same fills. `slippage` derives from `avg_px` in the same arithmetic.
 
 pub mod any;
-#[cfg(any(test, feature = "stubs"))]
-pub mod builder;
 pub mod limit;
 pub mod limit_if_touched;
 pub mod list;
@@ -29,6 +39,8 @@ pub mod stop_market;
 pub mod trailing_stop_limit;
 pub mod trailing_stop_market;
 
+#[cfg(any(test, feature = "stubs"))]
+pub mod builder;
 #[cfg(any(test, feature = "stubs"))]
 pub mod stubs;
 
@@ -230,6 +242,7 @@ impl OrderStatus {
             (Self::PendingUpdate, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::PendingUpdate, OrderEventAny::Expired(_)) => Self::Expired,
             (Self::PendingUpdate, OrderEventAny::Triggered(_)) => Self::Triggered,
+            (Self::PendingUpdate, OrderEventAny::Submitted(_)) => Self::PendingUpdate,  // Real world possibility
             (Self::PendingUpdate, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,  // Allow multiple requests
             (Self::PendingUpdate, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
             (Self::PendingUpdate, OrderEventAny::ModifyRejected(_)) => Self::PendingUpdate,  // Handled by modify_rejected to restore previous_status
@@ -331,8 +344,8 @@ pub trait Order: 'static + Send {
         }
     }
 
-    fn avg_px(&self) -> Option<f64>;
-    fn slippage(&self) -> Option<f64>;
+    fn avg_px(&self) -> Option<Decimal>;
+    fn slippage(&self) -> Option<Decimal>;
     fn init_id(&self) -> UUID4;
     fn ts_init(&self) -> UnixNanos;
     fn ts_submitted(&self) -> Option<UnixNanos>;
@@ -351,6 +364,7 @@ pub trait Order: 'static + Send {
     ///
     /// Returns an error if the event is invalid for the current order status.
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError>;
+
     fn update(&mut self, event: &OrderUpdated);
 
     fn events(&self) -> Vec<&OrderEventAny>;
@@ -620,11 +634,8 @@ pub trait Order: 'static + Send {
             report = report.with_cancel_reason(reason.to_string());
         }
 
-        // Skip a non-finite avg_px rather than fail the whole snapshot
-        if let Some(avg_px) = self.avg_px()
-            && let Ok(updated) = report.clone().with_avg_px(avg_px)
-        {
-            report = updated;
+        if let Some(avg_px) = self.avg_px() {
+            report = report.with_avg_px(avg_px);
         }
 
         Some(report)
@@ -723,8 +734,8 @@ pub struct OrderCore {
     pub voided_qty: Quantity,
     pub leaves_qty: Quantity,
     pub overfill_qty: Quantity,
-    pub avg_px: Option<f64>,
-    pub slippage: Option<f64>,
+    pub avg_px: Option<Decimal>,
+    pub slippage: Option<Decimal>,
     pub init_id: UUID4,
     pub ts_init: UnixNanos,
     pub ts_submitted: Option<UnixNanos>,
@@ -819,6 +830,55 @@ impl OrderCore {
             self.validate_fill_void(event)?;
         }
 
+        // Check for duplicate fill before state transition to maintain consistency
+        if let OrderEventAny::Filled(fill) = &event
+            && self.events.iter().any(
+                |event| matches!(event, OrderEventAny::Filled(existing) if existing.trade_id == fill.trade_id),
+            )
+        {
+            return Err(OrderError::DuplicateFill(fill.trade_id));
+        }
+
+        if matches!(event, OrderEventAny::Triggered(_))
+            && !TRIGGERABLE_ORDER_TYPES.contains(&self.order_type)
+        {
+            return Err(OrderError::InvalidOrderEvent);
+        }
+
+        if matches!(event, OrderEventAny::Initialized(_)) {
+            return Err(OrderError::AlreadyInitialized);
+        }
+
+        let new_status = self.status.transition(&event)?;
+        let rejection_status = if matches!(
+            event,
+            OrderEventAny::ModifyRejected(_) | OrderEventAny::CancelRejected(_)
+        ) {
+            self.previous_status.ok_or(OrderError::NoPreviousState)?
+        } else {
+            self.status
+        };
+
+        // Reject an update carrying fields the order type cannot hold before any
+        // mutation. Runs after the identity and transition checks so an identity
+        // mismatch or invalid transition is reported ahead of a field violation.
+        if let OrderEventAny::Updated(update) = &event {
+            let invalid_fields = match self.order_type {
+                OrderType::Market => update.price.is_some() || update.trigger_price.is_some(),
+                OrderType::StopMarket
+                | OrderType::MarketIfTouched
+                | OrderType::TrailingStopMarket => update.price.is_some(),
+                OrderType::Limit | OrderType::MarketToLimit => update.trigger_price.is_some(),
+                OrderType::StopLimit | OrderType::LimitIfTouched | OrderType::TrailingStopLimit => {
+                    false
+                }
+            };
+
+            if invalid_fields {
+                return Err(OrderError::InvalidOrderEvent);
+            }
+        }
+
         let source_status = self.status;
 
         // Save current status as previous_status for ALL transitions except:
@@ -837,25 +897,10 @@ impl OrderCore {
             self.previous_status = Some(self.status);
         }
 
-        // Check for duplicate fill before state transition to maintain consistency
-        if let OrderEventAny::Filled(fill) = &event
-            && self.events.iter().any(
-                |event| matches!(event, OrderEventAny::Filled(existing) if existing.trade_id == fill.trade_id),
-            )
-        {
-            return Err(OrderError::DuplicateFill(fill.trade_id));
-        }
-
-        if matches!(event, OrderEventAny::Triggered(_))
-            && !TRIGGERABLE_ORDER_TYPES.contains(&self.order_type)
-        {
-            return Err(OrderError::InvalidOrderEvent);
-        }
-
-        let new_status = self.status.transition(&event)?;
         self.status = new_status;
 
         match &event {
+            // Rejected by the pre-commit check above; kept for exhaustiveness
             OrderEventAny::Initialized(_) => return Err(OrderError::AlreadyInitialized),
             OrderEventAny::Denied(event) => self.denied(event),
             OrderEventAny::Emulated(event) => self.emulated(event),
@@ -865,8 +910,8 @@ impl OrderCore {
             OrderEventAny::Accepted(event) => self.accepted(event),
             OrderEventAny::PendingUpdate(event) => self.pending_update(event),
             OrderEventAny::PendingCancel(event) => self.pending_cancel(event),
-            OrderEventAny::ModifyRejected(event) => self.modify_rejected(event)?,
-            OrderEventAny::CancelRejected(event) => self.cancel_rejected(event)?,
+            OrderEventAny::ModifyRejected(event) => self.modify_rejected(event, rejection_status),
+            OrderEventAny::CancelRejected(event) => self.cancel_rejected(event, rejection_status),
             OrderEventAny::Updated(event) => self.updated(event),
             OrderEventAny::Triggered(event) => self.triggered(event),
             OrderEventAny::Canceled(event) => self.canceled(event),
@@ -916,14 +961,12 @@ impl OrderCore {
         // Do nothing else
     }
 
-    fn modify_rejected(&mut self, _event: &OrderModifyRejected) -> Result<(), OrderError> {
-        self.status = self.previous_status.ok_or(OrderError::NoPreviousState)?;
-        Ok(())
+    fn modify_rejected(&mut self, _event: &OrderModifyRejected, previous_status: OrderStatus) {
+        self.status = previous_status;
     }
 
-    fn cancel_rejected(&mut self, _event: &OrderCancelRejected) -> Result<(), OrderError> {
-        self.status = self.previous_status.ok_or(OrderError::NoPreviousState)?;
-        Ok(())
+    fn cancel_rejected(&mut self, _event: &OrderCancelRejected, previous_status: OrderStatus) {
+        self.status = previous_status;
     }
 
     fn triggered(&self, _event: &OrderTriggered) {}
@@ -1091,22 +1134,11 @@ impl OrderCore {
     }
 
     fn recompute_fill_state(&mut self, additional: Option<&OrderFillVoided>) -> Quantity {
-        let mut corrections: IndexMap<TradeId, &OrderFillVoided> = IndexMap::new();
-
-        for candidate in &self.events {
-            if let OrderEventAny::FillVoided(event) = candidate {
-                corrections.insert(event.trade_id, event);
-            }
-        }
-
-        if let Some(event) = additional {
-            corrections.insert(event.trade_id, event);
-        }
+        let corrections = self.fill_corrections(additional);
 
         let mut filled_raw = Quantity::zero(self.quantity.precision).raw;
         let mut voided_raw = Quantity::zero(self.quantity.precision).raw;
         let mut non_reopened_voided_raw = Quantity::zero(self.quantity.precision).raw;
-        let mut notional = 0.0;
         let mut commissions = IndexMap::<Currency, Money>::new();
         let mut trade_ids = Vec::new();
         let mut last_trade_id = None;
@@ -1122,10 +1154,7 @@ impl OrderCore {
             if correction.is_some() {
                 matched_corrections.insert(fill.trade_id);
             }
-            let removed = correction.map_or_else(
-                || Quantity::zero(fill.last_qty.precision),
-                |event| event.voided_qty.min(fill.last_qty),
-            );
+            let removed = Self::removed_fill_qty(fill, correction);
             let effective = fill.last_qty - removed;
             voided_raw = voided_raw.saturating_add(removed.raw);
             if correction.is_some_and(|event| !event.is_reopened) {
@@ -1134,7 +1163,6 @@ impl OrderCore {
 
             if !effective.is_zero() {
                 filled_raw = filled_raw.saturating_add(effective.raw);
-                notional += effective.as_f64() * fill.last_px.as_f64();
                 trade_ids.push(fill.trade_id);
                 last_trade_id = Some(fill.trade_id);
                 position_id = fill.position_id;
@@ -1165,7 +1193,7 @@ impl OrderCore {
         self.filled_qty = Quantity::from_raw(filled_raw, self.quantity.precision);
         self.voided_qty = Quantity::from_raw(voided_raw, self.quantity.precision);
         self.overfill_qty = self.filled_qty.saturating_sub(self.quantity);
-        self.avg_px = (!self.filled_qty.is_zero()).then(|| notional / self.filled_qty.as_f64());
+        self.avg_px = self.avg_px_from_fills(additional, None);
         self.commissions = commissions;
         self.trade_ids = trade_ids;
         self.last_trade_id = last_trade_id;
@@ -1251,7 +1279,7 @@ impl OrderCore {
             self.ts_accepted = Some(event.ts_event);
         }
 
-        self.set_avg_px(event.last_qty, event.last_px);
+        self.avg_px = self.avg_px_from_fills(None, Some(event));
 
         debug_assert!(
             matches!(
@@ -1265,7 +1293,7 @@ impl OrderCore {
             self.venue_order_id.is_some()
                 && self.last_trade_id.is_some()
                 && !self.trade_ids.is_empty(),
-            "Invariant: venue_order_id, last_trade_id and trade_ids must be set after fill"
+            "Invariant: venue_order_id, last_trade_id, and trade_ids must be set after fill"
         );
         debug_assert!(
             self.filled_qty
@@ -1281,36 +1309,72 @@ impl OrderCore {
         );
     }
 
-    fn set_avg_px(&mut self, last_qty: Quantity, last_px: Price) {
-        if self.avg_px.is_none() {
-            self.avg_px = Some(last_px.as_f64());
-            return;
+    // `Order::apply` appends the event after its handler runs, so a correction or fill still in
+    // flight arrives as `additional` / `pending` rather than through `self.events`.
+    fn avg_px_from_fills(
+        &self,
+        additional: Option<&OrderFillVoided>,
+        pending: Option<&OrderFilled>,
+    ) -> Option<Decimal> {
+        let corrections = self.fill_corrections(additional);
+        let mut notional = Decimal::ZERO;
+        let mut quantity = Decimal::ZERO;
+
+        for candidate in &self.events {
+            let OrderEventAny::Filled(fill) = candidate else {
+                continue;
+            };
+            let removed = Self::removed_fill_qty(fill, corrections.get(&fill.trade_id).copied());
+            let effective = (fill.last_qty - removed).as_decimal();
+            if effective.is_zero() {
+                continue;
+            }
+
+            notional = notional.saturating_add(effective.saturating_mul(fill.last_px.as_decimal()));
+            quantity = quantity.saturating_add(effective);
         }
 
-        // Use previous filled quantity (before current fill) to avoid double-counting
-        let prev_filled_qty = (self.filled_qty - last_qty).as_f64();
-        let last_qty_f64 = last_qty.as_f64();
-        let total_qty = prev_filled_qty + last_qty_f64;
+        if let Some(fill) = pending {
+            let last_qty = fill.last_qty.as_decimal();
+            notional = notional.saturating_add(last_qty.saturating_mul(fill.last_px.as_decimal()));
+            quantity = quantity.saturating_add(last_qty);
+        }
 
-        debug_assert!(
-            total_qty > 0.0,
-            "Invariant: avg_px calc requires positive total_qty (prev={prev_filled_qty}, last={last_qty_f64})"
-        );
+        notional.checked_div(quantity)
+    }
 
-        let avg_px = self
-            .avg_px
-            .unwrap()
-            .mul_add(prev_filled_qty, last_px.as_f64() * last_qty_f64)
-            / total_qty;
-        self.avg_px = Some(avg_px);
+    fn fill_corrections<'a>(
+        &'a self,
+        additional: Option<&'a OrderFillVoided>,
+    ) -> IndexMap<TradeId, &'a OrderFillVoided> {
+        let mut corrections = IndexMap::new();
+
+        for candidate in &self.events {
+            if let OrderEventAny::FillVoided(event) = candidate {
+                corrections.insert(event.trade_id, event);
+            }
+        }
+
+        if let Some(event) = additional {
+            corrections.insert(event.trade_id, event);
+        }
+
+        corrections
+    }
+
+    fn removed_fill_qty(fill: &OrderFilled, correction: Option<&OrderFillVoided>) -> Quantity {
+        correction.map_or_else(
+            || Quantity::zero(fill.last_qty.precision),
+            |event| event.voided_qty.min(fill.last_qty),
+        )
     }
 
     pub fn set_slippage(&mut self, price: Price) {
         self.slippage = self.avg_px.and_then(|avg_px| {
-            let current_price = price.as_f64();
+            let current_price = price.as_decimal();
             match self.side {
-                OrderSide::Buy if avg_px > current_price => Some(avg_px - current_price),
-                OrderSide::Sell if avg_px < current_price => Some(current_price - avg_px),
+                OrderSide::Buy if avg_px > current_price => avg_px.checked_sub(current_price),
+                OrderSide::Sell if avg_px < current_price => current_price.checked_sub(avg_px),
                 _ => None,
             }
         });
@@ -1387,6 +1451,8 @@ impl OrderCore {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -1394,10 +1460,10 @@ mod tests {
     use crate::{
         enums::{LiquiditySide, OrderSide, OrderStatus, PositionSide, TriggerType},
         events::order::spec::{
-            OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderExpiredSpec,
-            OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec, OrderPendingCancelSpec,
-            OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec, OrderTriggeredSpec,
-            OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec,
+            OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec,
+            OrderModifyRejectedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
+            OrderRejectedSpec, OrderSubmittedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
         },
         identifiers::InstrumentId,
         instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
@@ -1509,7 +1575,7 @@ mod tests {
         assert_eq!(order.status(), OrderStatus::Filled);
         assert_eq!(order.filled_qty(), Quantity::from(100_000));
         assert_eq!(order.leaves_qty(), Quantity::from(0));
-        assert_eq!(order.avg_px(), Some(1.0));
+        assert_eq!(order.avg_px(), Some(dec!(1.0)));
         assert!(!order.is_open());
         assert!(order.is_closed());
         assert_eq!(order.commission(&Currency::USD()), None);
@@ -1547,7 +1613,299 @@ mod tests {
         assert_eq!(order.filled_qty(), Quantity::from(100_000));
         assert_eq!(order.leaves_qty(), Quantity::from(0));
         // Weighted avg: (50_000 * -5.0 + 50_000 * -7.0) / 100_000 = -6.0
-        assert_eq!(order.avg_px(), Some(-6.0));
+        assert_eq!(order.avg_px(), Some(dec!(-6.0)));
+    }
+
+    fn fill(trade_id: &str, last_qty: &str, last_px: &str) -> (TradeId, Quantity, Price) {
+        (
+            TradeId::from(trade_id),
+            Quantity::from(last_qty),
+            Price::from(last_px),
+        )
+    }
+
+    fn market_order_with_fills(
+        order_side: OrderSide,
+        quantity: Quantity,
+        fills: &[(TradeId, Quantity, Price)],
+    ) -> MarketOrder {
+        let mut order: MarketOrder = OrderInitializedSpec::builder()
+            .order_side(order_side)
+            .quantity(quantity)
+            .build()
+            .try_into()
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+
+        for (trade_id, last_qty, last_px) in fills {
+            order
+                .apply(OrderEventAny::Filled(
+                    OrderFilledSpec::builder()
+                        .order_side(order_side)
+                        .trade_id(*trade_id)
+                        .last_qty(*last_qty)
+                        .last_px(*last_px)
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        order
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy)]
+    #[case(OrderSide::Sell)]
+    fn test_avg_px_weighted_average_is_exact(#[case] order_side: OrderSide) {
+        // (1 * 0.07) + (2 * 0.13) + (3 * 0.29) = 1.20 over 6 filled, so the exact average is
+        // 0.20. Accumulating the notional in f64 returns 0.19999999999999998 instead.
+        let order = market_order_with_fills(
+            order_side,
+            Quantity::from(6),
+            &[
+                fill("TRADE-1", "1", "0.07"),
+                fill("TRADE-2", "2", "0.13"),
+                fill("TRADE-3", "3", "0.29"),
+            ],
+        );
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from(6));
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+        assert_eq!(order.voided_qty(), Quantity::from(0));
+        assert_eq!(order.avg_px(), Some(dec!(0.2)));
+    }
+
+    #[rstest]
+    fn test_avg_px_keeps_a_quotient_no_f64_can_hold() {
+        // (1 * 1.00) + (2 * 2.00) = 5.00 over 3 filled. The exact quotient repeats, so `Decimal`
+        // carries it to its full 28-place scale where the widest `f64` holds 1.6666666666666667.
+        let order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from(3),
+            &[fill("TRADE-1", "1", "1.00"), fill("TRADE-2", "2", "2.00")],
+        );
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+        assert_eq!(order.avg_px(), Some(dec!(1.6666666666666666666666666667)));
+        assert_ne!(
+            order.avg_px(),
+            Some(Decimal::from_f64_retain(5.0_f64 / 3.0).unwrap())
+        );
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy, "1.07", "1.00", Some(dec!(0.07)))]
+    #[case(OrderSide::Sell, "0.93", "1.00", Some(dec!(0.07)))]
+    #[case(OrderSide::Buy, "0.93", "1.00", None)]
+    #[case(OrderSide::Sell, "1.07", "1.00", None)]
+    fn test_set_slippage_by_side(
+        #[case] order_side: OrderSide,
+        #[case] fill_px: &str,
+        #[case] reference_px: &str,
+        #[case] expected: Option<Decimal>,
+    ) {
+        // Slippage only accrues against the order: a buy filled above the reference price and a
+        // sell filled below it. The opposite cases are price improvement and stay `None`.
+        let mut order =
+            market_order_with_fills(order_side, Quantity::from(1), &[fill("T-1", "1", fill_px)]);
+
+        order.set_slippage(Price::from(reference_px));
+
+        assert_eq!(order.avg_px(), Some(Decimal::from_str(fill_px).unwrap()));
+        assert_eq!(order.slippage(), expected);
+    }
+
+    #[rstest]
+    fn test_avg_px_invariant_to_fill_arrival_order() {
+        // (50_000 * 1.00001) + (30_000 * 1.00002) + (20_000 * 1.00003) = 100_001.7 over
+        // 100_000 filled, so the exact average is 1.000017 whichever order the fills arrive
+        // in. The f64 fold returns 1.0000170000000002 for the ascending sequence only.
+        let mut fills = [
+            fill("TRADE-1", "50000", "1.00001"),
+            fill("TRADE-2", "30000", "1.00002"),
+            fill("TRADE-3", "20000", "1.00003"),
+        ];
+
+        let ascending = market_order_with_fills(OrderSide::Buy, Quantity::from(100_000), &fills);
+        fills.reverse();
+        let descending = market_order_with_fills(OrderSide::Buy, Quantity::from(100_000), &fills);
+
+        assert_eq!(ascending.avg_px(), Some(dec!(1.000_017)));
+        assert_eq!(descending.avg_px(), ascending.avg_px());
+        assert_eq!(descending.filled_qty(), ascending.filled_qty());
+    }
+
+    #[rstest]
+    fn test_avg_px_after_fill_void_matches_order_without_voided_fill() {
+        let surviving = [fill("TRADE-1", "1", "0.05"), fill("TRADE-2", "3", "0.15")];
+        let voided = fill("TRADE-VOIDED", "2", "0.13");
+
+        let expected = market_order_with_fills(OrderSide::Buy, Quantity::from(6), &surviving);
+        let mut corrected = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from(6),
+            &[surviving[0], surviving[1], voided],
+        );
+        corrected
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(voided.0)
+                    .voided_qty(voided.1)
+                    .last_px(voided.2)
+                    .build(),
+            ))
+            .unwrap();
+
+        let replayed =
+            OrderAny::from_events(corrected.events().into_iter().cloned().collect()).unwrap();
+
+        // (1 * 0.05) + (3 * 0.15) = 0.50 over 4 filled: 0.125 exactly, whether the fold runs
+        // incrementally over the fills, as the rebuild after the void drops the third fill, or
+        // over the whole event stream on replay. The f64 rebuild returns 0.12499999999999999.
+        assert_eq!(expected.avg_px(), Some(dec!(0.125)));
+        assert_eq!(corrected.avg_px(), expected.avg_px());
+        assert_eq!(replayed.avg_px(), expected.avg_px());
+        assert_eq!(corrected.status(), OrderStatus::Voided);
+        assert_eq!(corrected.filled_qty(), Quantity::from(4));
+        assert_eq!(corrected.voided_qty(), Quantity::from(2));
+        assert_eq!(corrected.leaves_qty(), Quantity::from(0));
+        assert_eq!(replayed.filled_qty(), corrected.filled_qty());
+        assert_eq!(replayed.voided_qty(), corrected.voided_qty());
+    }
+
+    #[rstest]
+    fn test_avg_px_recomputed_from_partially_voided_fill() {
+        let mut order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from(6),
+            &[fill("TRADE-1", "4", "1.00"), fill("TRADE-2", "2", "1.14")],
+        );
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(TradeId::from("TRADE-1"))
+                    .voided_qty(Quantity::from(2))
+                    .last_px(Price::from("1.00"))
+                    .build(),
+            ))
+            .unwrap();
+
+        // Surviving (2 * 1.00) + (2 * 1.14) = 4.28 over 4 filled: 1.07 exactly, where the f64
+        // rebuild returns 1.0699999999999998.
+        assert_eq!(order.status(), OrderStatus::Voided);
+        assert_eq!(order.filled_qty(), Quantity::from(4));
+        assert_eq!(order.voided_qty(), Quantity::from(2));
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+        assert_eq!(order.avg_px(), Some(dec!(1.07)));
+    }
+
+    #[rstest]
+    fn test_avg_px_over_reopened_fill_void_and_replacement_fill() {
+        let mut order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from(6),
+            &[fill("TRADE-1", "4", "1.00")],
+        );
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(TradeId::from("TRADE-1"))
+                    .voided_qty(Quantity::from(2))
+                    .last_px(Price::from("1.00"))
+                    .is_reopened(true)
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trade_id(TradeId::from("TRADE-2"))
+                    .last_qty(Quantity::from(2))
+                    .last_px(Price::from("1.14"))
+                    .build(),
+            ))
+            .unwrap();
+        order.set_slippage(Price::from("1.00"));
+
+        // The reopened void leaves 2 of the first fill, so the replacement fill folds against
+        // the surviving quantity: (2 * 1.00) + (2 * 1.14) = 4.28 over 4 filled, or 1.07
+        // exactly. The f64 update returns 1.0699999999999998, which slippage then inherits.
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(4));
+        assert_eq!(order.voided_qty(), Quantity::from(2));
+        assert_eq!(order.leaves_qty(), Quantity::from(2));
+        assert_eq!(order.avg_px(), Some(dec!(1.07)));
+        assert_eq!(order.slippage(), Some(dec!(0.07)));
+    }
+
+    #[rstest]
+    fn test_avg_px_cleared_when_every_fill_is_voided() {
+        let mut order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from(6),
+            &[fill("TRADE-1", "4", "1.50")],
+        );
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(TradeId::from("TRADE-1"))
+                    .voided_qty(Quantity::from(4))
+                    .last_px(Price::from("1.50"))
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.filled_qty(), Quantity::from(0));
+        assert_eq!(order.voided_qty(), Quantity::from(4));
+        assert_eq!(order.leaves_qty(), Quantity::from(2));
+        assert_eq!(order.avg_px(), None);
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_avg_px_exact_over_high_precision_quantities() {
+        // Same weighting as `test_avg_px_invariant_to_fill_arrival_order`, at a quantity
+        // precision only the wider raw backing can hold.
+        let order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from("0.000000000010"),
+            &[
+                fill("TRADE-1", "0.000000000005", "1.00001"),
+                fill("TRADE-2", "0.000000000003", "1.00002"),
+                fill("TRADE-3", "0.000000000002", "1.00003"),
+            ],
+        );
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from("0.000000000010"));
+        assert_eq!(order.avg_px(), Some(dec!(1.000_017)));
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_avg_px_exact_at_the_widest_representable_fill_scale() {
+        // Pins the exactness bound: a 16-decimal quantity against a 12-decimal price needs the
+        // 28 fractional digits Decimal carries, so no product rounds.
+        let order = market_order_with_fills(
+            OrderSide::Buy,
+            Quantity::from("0.0000000000000008"),
+            &[
+                fill("TRADE-1", "0.0000000000000002", "0.000000000001"),
+                fill("TRADE-2", "0.0000000000000006", "0.000000000003"),
+            ],
+        );
+
+        // (2e-16 * 1e-12) + (6e-16 * 3e-12) = 2e-27 over 8e-16 filled: 2.5e-12 exactly.
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from("0.0000000000000008"));
+        assert_eq!(order.avg_px(), Some(dec!(2.5e-12)));
     }
 
     #[rstest]
@@ -2113,6 +2471,7 @@ mod tests {
     fn test_order_is_contingency() {
         let order: MarketOrder = OrderInitializedSpec::builder()
             .contingency_type(ContingencyType::Oto)
+            .linked_order_ids(vec![ClientOrderId::from("O-LINKED")])
             .build()
             .try_into()
             .unwrap();
@@ -2574,6 +2933,219 @@ mod tests {
 
         assert_eq!(order.status(), OrderStatus::Accepted);
         assert_eq!(order.quantity(), Quantity::from(50_000));
+    }
+
+    #[rstest]
+    fn test_pending_update_accepts_delayed_submitted() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .ts_event(UnixNanos::from(1_000))
+            .build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let pending_update = OrderPendingUpdateSpec::builder().build();
+
+        // A distinct account and timestamp so the `submitted` handler's writes are
+        // observable: with identical specs the assertions below cannot tell whether
+        // the handler ran at all.
+        let delayed_submitted = OrderSubmittedSpec::builder()
+            .account_id(AccountId::from("SIM-002"))
+            .ts_event(UnixNanos::from(3_000))
+            .build();
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(50_000))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order
+            .apply(OrderEventAny::PendingUpdate(pending_update))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::PendingUpdate);
+        assert_eq!(order.previous_status(), Some(OrderStatus::Accepted));
+        assert_eq!(order.account_id(), Some(AccountId::from("SIM-001")));
+        assert_eq!(order.ts_submitted(), Some(UnixNanos::from(1_000)));
+
+        order
+            .apply(OrderEventAny::Submitted(delayed_submitted))
+            .unwrap();
+
+        // The order holds PendingUpdate and keeps the pre-update status, so the
+        // in-flight modify can still be resolved.
+        assert_eq!(order.status(), OrderStatus::PendingUpdate);
+        assert_eq!(order.previous_status(), Some(OrderStatus::Accepted));
+
+        // The handler applied the delayed event's fields, matching `_submitted` in
+        // the Cython engine (`base.pyx`), which assigns both unconditionally.
+        assert_eq!(order.account_id(), Some(AccountId::from("SIM-002")));
+        assert_eq!(order.ts_submitted(), Some(UnixNanos::from(3_000)));
+
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(50_000));
+    }
+
+    #[rstest]
+    fn test_rejected_event_preserves_status_restoration() {
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let invalid = OrderSubmittedSpec::builder().build();
+        let pending_update = OrderPendingUpdateSpec::builder().build();
+        let modify_rejected = OrderModifyRejectedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        let previous_status = order.previous_status();
+
+        let result = order.apply(OrderEventAny::Submitted(invalid));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.previous_status(), previous_status);
+
+        order
+            .apply(OrderEventAny::PendingUpdate(pending_update))
+            .unwrap();
+        order
+            .apply(OrderEventAny::ModifyRejected(modify_rejected))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_rejected_event_preserves_cancel_rejected_restoration() {
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let invalid = OrderSubmittedSpec::builder().build();
+        let pending_cancel = OrderPendingCancelSpec::builder().build();
+        let cancel_rejected = OrderCancelRejectedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        let previous_status = order.previous_status();
+
+        let result = order.apply(OrderEventAny::Submitted(invalid));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.previous_status(), previous_status);
+
+        order
+            .apply(OrderEventAny::PendingCancel(pending_cancel))
+            .unwrap();
+        order
+            .apply(OrderEventAny::CancelRejected(cancel_rejected))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    #[case(true, false, "client_order_id")]
+    #[case(false, true, "strategy_id")]
+    fn test_update_identity_mismatch_precedes_field_validation(
+        #[case] wrong_client: bool,
+        #[case] wrong_strategy: bool,
+        #[case] expected_field: &str,
+    ) {
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        let state = (
+            order.status(),
+            order.previous_status(),
+            order.ts_last(),
+            order.events().len(),
+        );
+        let client_order_id = if wrong_client {
+            ClientOrderId::from("O-INVALID")
+        } else {
+            order.client_order_id()
+        };
+        let strategy_id = if wrong_strategy {
+            StrategyId::from("OTHER-001")
+        } else {
+            order.strategy_id()
+        };
+        // Carry both a mismatched identity and a price a MarketOrder cannot hold:
+        // the identity mismatch must be reported ahead of the field violation.
+        let updated = OrderUpdatedSpec::builder()
+            .client_order_id(client_order_id)
+            .strategy_id(strategy_id)
+            .price(Price::new(95.0, 2))
+            .build();
+
+        let result = order.apply(OrderEventAny::Updated(updated));
+
+        // The specific identity predicate must surface, not the field violation.
+        let Err(OrderError::Invariant(CorrectnessError::PredicateViolation { message })) = result
+        else {
+            panic!("expected an identity predicate violation, was {result:?}");
+        };
+        assert!(
+            message.contains(expected_field),
+            "message did not name {expected_field}: {message}"
+        );
+        assert_eq!(order.status(), state.0);
+        assert_eq!(order.previous_status(), state.1);
+        assert_eq!(order.ts_last(), state.2);
+        assert_eq!(order.events().len(), state.3);
+    }
+
+    #[rstest]
+    fn test_update_invalid_transition_precedes_field_validation() {
+        let init = OrderInitializedSpec::builder().build();
+        let denied = OrderDeniedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Denied(denied)).unwrap();
+        let state = (
+            order.status(),
+            order.previous_status(),
+            order.ts_last(),
+            order.events().len(),
+        );
+        // No (Denied, Updated) transition exists, and the price is invalid for a
+        // MarketOrder: the transition check must win over the field violation.
+        let updated = OrderUpdatedSpec::builder()
+            .price(Price::new(95.0, 2))
+            .build();
+
+        let result = order.apply(OrderEventAny::Updated(updated));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.status(), state.0);
+        assert_eq!(order.previous_status(), state.1);
+        assert_eq!(order.ts_last(), state.2);
+        assert_eq!(order.events().len(), state.3);
+    }
+
+    #[rstest]
+    fn test_direct_update_panics_on_invalid_field_before_mutation() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        let original_quantity = order.quantity();
+        // A distinct quantity so any mutation would be observable, alongside a
+        // price the type cannot hold. The low-level mutation path retains a
+        // defensive guard: a direct update() panics on the invalid field before
+        // it reaches the quantity assignment.
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(50_000))
+            .price(Price::new(95.0, 2))
+            .build();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| order.update(&updated)));
+
+        assert!(result.is_err());
+        assert_eq!(order.quantity(), original_quantity);
     }
 
     #[rstest]

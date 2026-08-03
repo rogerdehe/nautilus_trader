@@ -1,21 +1,20 @@
 # Bar
 
-`Bar` represents OHLCV price and volume data for a specific `BarType`. Bars can be
-provided externally by a venue or data provider, aggregated internally from quote or
-trade ticks, or aggregated from smaller bars.
+`Bar` represents OHLCV price and volume data for a specific `BarType`. A venue or data provider
+can supply bars, or NautilusTrader can aggregate them from quote ticks, trade ticks, or smaller bars.
 
 ## Fields
 
-| Field      | Rust type   | Python type | Required/default | Notes                                    |
-|------------|-------------|-------------|------------------|------------------------------------------|
+| Field      | Rust type   | Python type | Required/default | Notes                                            |
+| ---------- | ----------- | ----------- | ---------------- | ------------------------------------------------ |
 | `bar_type` | `BarType`   | `BarType`   | Required         | Instrument, aggregation, price type, and source. |
-| `open`     | `Price`     | `Price`     | Required         | First price in the bar interval.         |
-| `high`     | `Price`     | `Price`     | Required         | Highest price in the bar interval.       |
-| `low`      | `Price`     | `Price`     | Required         | Lowest price in the bar interval.        |
-| `close`    | `Price`     | `Price`     | Required         | Last price in the bar interval.          |
-| `volume`   | `Quantity`  | `Quantity`  | Required         | Traded volume or tick‑volume proxy.      |
-| `ts_event` | `UnixNanos` | `int`       | Required         | Bar event timestamp in nanoseconds.      |
-| `ts_init`  | `UnixNanos` | `int`       | Required         | Initialization timestamp in nanoseconds. |
+| `open`     | `Price`     | `Price`     | Required         | First price in the bar interval.                 |
+| `high`     | `Price`     | `Price`     | Required         | Highest price in the bar interval.               |
+| `low`      | `Price`     | `Price`     | Required         | Lowest price in the bar interval.                |
+| `close`    | `Price`     | `Price`     | Required         | Last price in the bar interval.                  |
+| `volume`   | `Quantity`  | `Quantity`  | Required         | Traded volume or tick‑volume proxy.              |
+| `ts_event` | `UnixNanos` | `int`       | Required         | Bar event timestamp in nanoseconds.              |
+| `ts_init`  | `UnixNanos` | `int`       | Required         | Initialization timestamp in nanoseconds.         |
 
 ## Behavior
 
@@ -67,4 +66,4 @@ bar = Bar(
 
 - [Bars and aggregation](index.md#bars-and-aggregation) covers aggregation methods.
 - [Bar types](index.md#bar-types) explains `BarType` string syntax.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

@@ -25,6 +25,7 @@ use nautilus_common::{
     clock::Clock,
     msgbus::TypedHandler,
 };
+use nautilus_core::Params;
 use nautilus_model::{
     events::{OrderEventAny, PositionEvent},
     identifiers::{ActorId, ClientOrderId, ExecAlgorithmId, StrategyId, TraderId},
@@ -71,6 +72,8 @@ pub struct ExecutionAlgorithmCore {
     subscribed_strategies: AHashSet<StrategyId>,
     /// Tracks pending spawn reductions for quantity restoration on denial/rejection.
     pending_spawn_reductions: AHashMap<ClientOrderId, Quantity>,
+    /// Maps primary order client IDs to the command params supplied at submission.
+    submit_params: AHashMap<ClientOrderId, Params>,
     /// The portfolio shared by the trader.
     portfolio: Option<Rc<RefCell<Portfolio>>>,
     /// Maps strategies to their event handlers for cleanup on reset.
@@ -120,6 +123,7 @@ impl Debug for ExecutionAlgorithmCore {
                 "pending_spawn_reductions",
                 &self.pending_spawn_reductions.len(),
             )
+            .field("submit_params", &self.submit_params.len())
             .field(
                 "strategy_event_handlers",
                 &self.strategy_event_handlers.len(),
@@ -153,6 +157,7 @@ impl ExecutionAlgorithmCore {
             exec_spawn_ids: AHashMap::new(),
             subscribed_strategies: AHashSet::new(),
             pending_spawn_reductions: AHashMap::new(),
+            submit_params: AHashMap::new(),
             portfolio: None,
             strategy_event_handlers: IndexMap::new(),
         }
@@ -253,6 +258,33 @@ impl ExecutionAlgorithmCore {
         self.pending_spawn_reductions.clear();
     }
 
+    /// Stores the command params supplied with a primary order submission.
+    ///
+    /// A `None` or empty params map is ignored, so no lookup is created for orders without params.
+    pub fn remember_submit_params(&mut self, primary_id: ClientOrderId, params: Option<Params>) {
+        if let Some(params) = params
+            && !params.is_empty()
+        {
+            self.submit_params.insert(primary_id, params);
+        }
+    }
+
+    /// Returns a clone of the submit command params stored for a primary order, if any.
+    #[must_use]
+    pub fn submit_params(&self, primary_id: &ClientOrderId) -> Option<Params> {
+        self.submit_params.get(primary_id).cloned()
+    }
+
+    /// Removes the stored submit command params for a primary order.
+    pub fn remove_submit_params(&mut self, primary_id: &ClientOrderId) {
+        self.submit_params.remove(primary_id);
+    }
+
+    /// Clears all stored submit command params.
+    pub fn clear_submit_params(&mut self) {
+        self.submit_params.clear();
+    }
+
     /// Resets the core to its initial state.
     ///
     /// Note: This clears handler storage but does NOT unsubscribe from msgbus.
@@ -261,6 +293,7 @@ impl ExecutionAlgorithmCore {
         self.exec_spawn_ids.clear();
         self.subscribed_strategies.clear();
         self.pending_spawn_reductions.clear();
+        self.submit_params.clear();
         self.strategy_event_handlers.clear();
     }
 
@@ -406,6 +439,31 @@ mod tests {
 
         core.clear_spawn_ids();
         assert!(core.spawn_sequence(&primary_id).is_none());
+    }
+
+    #[rstest]
+    fn test_remove_submit_params_only_removes_requested_primary() {
+        let config = create_test_config();
+        let mut core = ExecutionAlgorithmCore::new(config);
+        let primary1 = ClientOrderId::new("O-001");
+        let primary2 = ClientOrderId::new("O-002");
+        let mut params1 = Params::new();
+        params1.insert(
+            "route".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        let mut params2 = Params::new();
+        params2.insert(
+            "route".to_string(),
+            serde_json::Value::String("B".to_string()),
+        );
+
+        core.remember_submit_params(primary1, Some(params1));
+        core.remember_submit_params(primary2, Some(params2.clone()));
+        core.remove_submit_params(&primary1);
+
+        assert_eq!(core.submit_params(&primary1), None);
+        assert_eq!(core.submit_params(&primary2), Some(params2));
     }
 
     #[rstest]

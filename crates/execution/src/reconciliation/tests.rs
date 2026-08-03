@@ -33,7 +33,7 @@ use nautilus_model::{
     },
     instruments::{
         Instrument, InstrumentAny,
-        stubs::{audusd_sim, binary_option, crypto_perpetual_ethusdt},
+        stubs::{audusd_sim, binary_option, crypto_perpetual_ethusdt, futures_spread_es},
     },
     orders::{
         Order, OrderAny, OrderTestBuilder,
@@ -405,6 +405,27 @@ fn test_check_position_match_within_tolerance() {
 fn test_check_position_match_qty_mismatch() {
     let result = check_position_match(dec!(10), dec!(1000), dec!(11), dec!(100), dec!(0.0001));
     assert!(!result);
+}
+
+#[rstest]
+fn test_check_position_match_negative_venue_avg_px() {
+    // Simulated avg px = -1000/10 = -100, venue = -100.005: within tolerance
+    assert!(check_position_match(
+        dec!(10),
+        dec!(-1000),
+        dec!(10),
+        dec!(-100.005),
+        dec!(0.0001)
+    ));
+    // Simulated avg px = -100, venue = -110: ~9% divergence must not match
+    // without an absolute denominator, since the negative ratio always passes the tolerance.
+    assert!(!check_position_match(
+        dec!(10),
+        dec!(-1000),
+        dec!(10),
+        dec!(-110),
+        dec!(0.0001)
+    ));
 }
 
 #[rstest]
@@ -1314,8 +1335,7 @@ fn make_test_report(
         None,
     )
     .with_price(Price::from("100.00"))
-    .with_avg_px(100.0)
-    .unwrap();
+    .with_avg_px(dec!(100.0));
     report.post_only = post_only;
     report
 }
@@ -1441,6 +1461,7 @@ fn test_external_order_rejected_due_post_only() {
 #[case::market(OrderType::Market, false, LiquiditySide::Taker)]
 #[case::stop_market(OrderType::StopMarket, false, LiquiditySide::Taker)]
 #[case::trailing_stop_market(OrderType::TrailingStopMarket, false, LiquiditySide::Taker)]
+#[case::market_to_limit(OrderType::MarketToLimit, false, LiquiditySide::Taker)]
 #[case::limit_post_only(OrderType::Limit, true, LiquiditySide::Maker)]
 #[case::limit_default(OrderType::Limit, false, LiquiditySide::NoLiquiditySide)]
 fn test_inferred_fill_liquidity_side(
@@ -1455,6 +1476,7 @@ fn test_inferred_fill_liquidity_side(
             .side(OrderSide::Buy)
             .quantity(Quantity::from("1.0"))
             .price(Price::from("100.00"))
+            .post_only(post_only)
             .build(),
         OrderType::StopMarket => OrderTestBuilder::new(order_type)
             .instrument_id(instrument.id())
@@ -1540,6 +1562,98 @@ fn test_inferred_fill_no_price_returns_none() {
     assert!(fill.is_none());
 }
 
+#[rstest]
+fn test_inferred_fill_falls_back_to_order_price() {
+    // The venue reports a fill but carries no price of its own, so the resting price on the
+    // order is the last remaining evidence of what it executed at.
+    let instrument = crypto_perpetual_ethusdt();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.0"))
+        .price(Price::from("100.00"))
+        .build();
+
+    let report = OrderStatusReport::new(
+        AccountId::from("TEST-001"),
+        instrument.id(),
+        None,
+        VenueOrderId::from("V-001"),
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+
+    let fill = create_inferred_fill(
+        &order,
+        &report,
+        AccountId::from("TEST-001"),
+        &InstrumentAny::CryptoPerpetual(instrument),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, Price::from("100.00"));
+}
+
+#[rstest]
+fn test_inferred_fill_falls_through_unusable_venue_average() {
+    // An avg_px outside the representable `Price` range cannot build a price, so resolution
+    // continues to the next source rather than abandoning the fill.
+    let instrument = crypto_perpetual_ethusdt();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.0"))
+        .price(Price::from("100.00"))
+        .build();
+
+    let report = OrderStatusReport::new(
+        AccountId::from("TEST-001"),
+        instrument.id(),
+        None,
+        VenueOrderId::from("V-001"),
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(99999999999999999999))
+    .with_price(Price::from("102.00"));
+
+    let fill = create_inferred_fill(
+        &order,
+        &report,
+        AccountId::from("TEST-001"),
+        &InstrumentAny::CryptoPerpetual(instrument),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, Price::from("102.00"));
+}
+
 /// A binary option with an explicit `[0.001, 0.999]` price band, as the
 /// Polymarket adapter sets, so the inferred-fill price clamp has bounds to apply.
 fn bounded_binary_option() -> InstrumentAny {
@@ -1593,8 +1707,7 @@ fn test_incremental_inferred_fill_clamps_out_of_range_price() {
         UnixNanos::from(1_000_000),
         None,
     )
-    .with_avg_px(0.510)
-    .unwrap();
+    .with_avg_px(dec!(0.510));
 
     let fill = create_incremental_inferred_fill(
         &order,
@@ -1644,8 +1757,7 @@ fn test_inferred_fill_clamps_out_of_range_avg_px() {
         UnixNanos::from(1_000_000),
         None,
     )
-    .with_avg_px(43.642)
-    .unwrap();
+    .with_avg_px(dec!(43.642));
 
     let fill = create_inferred_fill(
         &order,
@@ -1661,6 +1773,418 @@ fn test_inferred_fill_clamps_out_of_range_avg_px() {
         other => panic!("Expected Filled event, was {other:?}"),
     };
     assert_eq!(filled.last_px, instrument.max_price().unwrap());
+}
+
+#[rstest]
+fn test_incremental_fill_price_negative_back_solve_uses_venue_average() {
+    // Back-solve ((110 * 40) - (100 * 50)) / 10 = -60
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    assert!(!instrument.allows_negative_price());
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("50.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("50.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("110.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(40.00));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px.as_decimal(), dec!(40.00));
+    assert_eq!(filled.last_qty, Quantity::from("10.0"));
+}
+
+#[rstest]
+fn test_incremental_fill_price_negative_venue_average_with_negative_back_solve_returns_none() {
+    // Back-solve ((110 * -1) - (100 * 5)) / 10 = -61, with a negative venue average too
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    assert!(!instrument.allows_negative_price());
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("5.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("5.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("110.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(-1.00));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    assert!(fill.is_none());
+}
+
+#[rstest]
+fn test_incremental_fill_price_falls_through_unusable_venue_average() {
+    // The order has fills, so pricing runs the back-solve rather than the ladder. An unusable
+    // avg_px must still reach the ladder instead of abandoning the fill
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("50.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("50.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("110.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(99999999999999999999))
+    .with_price(Price::from("47.00"));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px.as_decimal(), dec!(47.00));
+    assert_eq!(filled.last_qty, Quantity::from("10.0"));
+}
+
+#[rstest]
+fn test_incremental_fill_price_falls_through_unrepresentable_back_solve() {
+    // Back-solve ((1e9 * 100.001) - (50 * 100)) / 0.001 is unrepresentable on a dust quantity,
+    // while the venue average 1e9 is not
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("50.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("50.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("100.001"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(1000000000));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    // The venue average stands in, then the existing clamp caps it at the instrument maximum.
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, instrument.max_price().unwrap());
+    assert_eq!(filled.last_qty, Quantity::from("0.001"));
+}
+
+#[rstest]
+fn test_incremental_fill_price_books_an_exactly_zero_back_solve() {
+    // Back-solve ((40 * 125) - (50 * 100)) / 25 = 0 exactly, against a positive venue average.
+    // Zero is a real price, so it must be booked rather than corrected to the average: the guard
+    // covers negative results only.
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("50.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("50.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("125.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(40.00));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px.as_decimal(), dec!(0.00));
+    assert_eq!(filled.last_qty, Quantity::from("25.0"));
+}
+
+#[rstest]
+#[case(Some(Price::from("47.00")), dec!(47.00))]
+#[case(None, dec!(50.00))]
+fn test_incremental_fill_price_without_venue_average_uses_the_ladder(
+    #[case] report_price: Option<Price>,
+    #[case] expected: Decimal,
+) {
+    // A venue that reports no average on a partially filled order skips the back-solve entirely,
+    // so the incremental path depends on the same rung order as every other site.
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200.0"))
+        .price(Price::from("50.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100.0"),
+        Price::from("50.00"),
+    );
+
+    let mut report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200.0"),
+        Quantity::from("110.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    report.price = report_price;
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px.as_decimal(), expected);
+    assert_eq!(filled.last_qty, Quantity::from("10.0"));
+}
+
+#[rstest]
+fn test_incremental_fill_price_keeps_negative_back_solve_when_instrument_allows_it() {
+    // Back-solve ((110 * 1) - (100 * 5)) / 10 = -39
+    let instrument = InstrumentAny::FuturesSpread(futures_spread_es());
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    assert!(instrument.allows_negative_price());
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .price(Price::from("5.00"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("100"),
+        Price::from("5.00"),
+    );
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("200"),
+        Quantity::from("110"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(dec!(1.00));
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px.as_decimal(), dec!(-39.00));
+    assert_eq!(filled.last_qty, Quantity::from("10"));
 }
 
 #[rstest]
@@ -1734,8 +2258,7 @@ fn test_inferred_fill_for_qty_clamps_out_of_range_avg_px() {
         UnixNanos::from(1_000_000),
         None,
     )
-    .with_avg_px(43.642)
-    .unwrap();
+    .with_avg_px(dec!(43.642));
 
     let fill = create_inferred_fill_for_qty(
         &order,
@@ -4252,8 +4775,7 @@ fn test_create_inferred_fill_for_qty_uses_report_avg_px() {
         UnixNanos::from(1_000_000),
         None,
     )
-    .with_avg_px(105.50)
-    .unwrap();
+    .with_avg_px(dec!(105.50));
 
     let result = create_inferred_fill_for_qty(
         &order,
@@ -4598,8 +5120,7 @@ fn test_create_incremental_inferred_fill_with_commission() {
         UnixNanos::from(1_000_000),
         None,
     )
-    .with_avg_px(100.0)
-    .unwrap();
+    .with_avg_px(dec!(100.0));
 
     let commission = Some(Money::new(2.50, Currency::USDT()));
 
@@ -5205,6 +5726,68 @@ fn test_reconciliation_fill_decrease_carries_terminal_disposition(
 }
 
 #[rstest]
+fn test_reconciliation_fill_void_carries_proportional_commission(instrument: InstrumentAny) {
+    let client_order_id = ClientOrderId::from("O-FILL-VOID-COMMISSION");
+    let venue_order_id = VenueOrderId::from("V-FILL-VOID-COMMISSION");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    order
+        .apply(OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .venue_order_id(venue_order_id)
+                .account_id(account_id)
+                .trade_id(TradeId::from("T-COMMISSION"))
+                .order_side(OrderSide::Buy)
+                .order_type(OrderType::Limit)
+                .last_qty(Quantity::from(100))
+                .last_px(Price::from("1.00000"))
+                .currency(instrument.quote_currency())
+                .maybe_commission(Some(Money::new(2.0, instrument.quote_currency())))
+                .build(),
+        ))
+        .unwrap();
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(100),
+        Quantity::from(40),
+    );
+    report.avg_px = Some(dec!(1.0));
+
+    let events = generate_reconciliation_order_snapshot_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(10),
+    );
+    let voided = match &events[0] {
+        OrderEventAny::FillVoided(event) => event,
+        other => panic!("expected fill correction, was {other:?}"),
+    };
+
+    assert_eq!(voided.voided_qty, Quantity::from(60));
+    assert_eq!(
+        voided.commission_voided,
+        Some(Money::new(1.20, instrument.quote_currency())),
+        "voided commission must be proportional to the voided quantity",
+    );
+}
+
+#[rstest]
 fn test_terminal_fill_void_uses_remaining_leaves_after_fill_correction(instrument: InstrumentAny) {
     let client_order_id = ClientOrderId::from("O-FILL-VOID-TERMINAL");
     let venue_order_id = VenueOrderId::from("V-FILL-VOID-TERMINAL");
@@ -5267,6 +5850,72 @@ fn test_terminal_fill_void_uses_remaining_leaves_after_fill_correction(instrumen
     );
     assert_eq!(after.status(), OrderStatus::Voided);
     assert_eq!(after.filled_qty(), Quantity::from(0));
+    assert_eq!(after.voided_qty(), Quantity::from(100));
+}
+
+#[rstest]
+fn test_terminal_fill_void_survives_unusable_venue_average(instrument: InstrumentAny) {
+    // Same trace as the terminal-void test above, but with an unusable venue average. A void
+    // reverses quantity, so it must not be suppressed by a price it does not depend on
+    let client_order_id = ClientOrderId::from("O-FILL-VOID-UNUSABLE-PX");
+    let venue_order_id = VenueOrderId::from("V-FILL-VOID-UNUSABLE-PX");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    order
+        .apply(OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .venue_order_id(venue_order_id)
+                .account_id(account_id)
+                .trade_id(TradeId::from("T-FILL-VOID-UNUSABLE-PX"))
+                .order_side(OrderSide::Buy)
+                .order_type(OrderType::Limit)
+                .last_qty(Quantity::from(60))
+                .last_px(Price::from("1.00000"))
+                .currency(instrument.quote_currency())
+                .build(),
+        ))
+        .unwrap();
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Voided,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+    report.avg_px = Some(dec!(99999999999999999999));
+
+    let events = generate_reconciliation_order_snapshot_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(10),
+    );
+    let after = apply_events(&order, &events);
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| match event {
+                OrderEventAny::FillVoided(event) => event.voided_qty,
+                other => panic!("expected fill correction, was {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec![Quantity::from(60), Quantity::from(40)],
+    );
+    assert_eq!(after.status(), OrderStatus::Voided);
     assert_eq!(after.voided_qty(), Quantity::from(100));
 }
 

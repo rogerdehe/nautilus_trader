@@ -97,13 +97,17 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-execution = { workspace = true }
-nautilus-testkit = { workspace = true }
+nautilus-sandbox = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
 nautilus-trading = { workspace = true }
 
 axum = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 [[bench]]

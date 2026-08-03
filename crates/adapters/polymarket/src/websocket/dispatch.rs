@@ -60,7 +60,7 @@ use crate::{
         order_fill_tracker::{BufferedFill, FillCorrectionMetadata, OrderFillTrackerMap},
         parse::{
             build_maker_fill_report, compute_commission, determine_order_side,
-            instrument_taker_fee, parse_liquidity_side,
+            instrument_fee_exponent, instrument_taker_fee, parse_liquidity_side,
         },
         pending::PendingSubmitTracker,
     },
@@ -730,7 +730,13 @@ fn build_ws_taker_fill_report(
         .unwrap_or_else(|_| Price::zero(price_precision));
 
     let fee_rate = instrument_taker_fee(instrument);
-    let commission_value = compute_commission(fee_rate, size_dec, price_dec, liquidity_side);
+    let commission_value = compute_commission(
+        fee_rate,
+        instrument_fee_exponent(instrument),
+        size_dec,
+        price_dec,
+        liquidity_side,
+    );
     let pusd = crate::execution::get_pusd_currency();
 
     FillReport {
@@ -1184,9 +1190,13 @@ mod tests {
         let info = trade_fill_info(&trade).expect("info should be present");
 
         // Every raw trade field is captured (mirrors v1 info=msg.to_dict()).
-        assert_eq!(info.len(), 20);
+        assert_eq!(info.len(), 21);
         assert_eq!(info[&Ustr::from("id")], Ustr::from("trade-0xabcdef1234"));
         assert_eq!(info[&Ustr::from("fee_rate_bps")], Ustr::from("0"));
+        assert_eq!(
+            info[&Ustr::from("transaction_hash")],
+            Ustr::from("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")
+        );
         // Numeric fields flatten to their string form.
         assert_eq!(info[&Ustr::from("bucket_index")], Ustr::from("1"));
         assert_eq!(info[&Ustr::from("size")], Ustr::from("25.0"));
@@ -1200,6 +1210,11 @@ mod tests {
         let maker_orders = info[&Ustr::from("maker_orders")].as_str();
         assert!(maker_orders.starts_with('['));
         assert!(maker_orders.contains("order_id"));
+
+        let empty_hash_trade: PolymarketUserTrade = load("ws_user_trade_msg.json");
+        let empty_hash_info =
+            trade_fill_info(&empty_hash_trade).expect("empty hash info should be present");
+        assert!(!empty_hash_info.contains_key(&Ustr::from("transaction_hash")));
     }
 
     #[rstest]
@@ -2151,6 +2166,7 @@ mod tests {
             taker_order_id: "0xtaker01".to_string(),
             timestamp: ts.to_string(),
             trade_owner: Ustr::from("other-owner"),
+            transaction_hash: None,
             trader_side: PolymarketLiquiditySide::Maker,
             event_type: PolymarketEventType::Trade,
         };
@@ -2314,6 +2330,7 @@ mod tests {
             taker_order_id: venue_order_id.as_str().to_string(),
             timestamp: "1700000000000".to_string(),
             trade_owner: Ustr::from("00000000-0000-0000-0000-000000000001"),
+            transaction_hash: None,
             trader_side: PolymarketLiquiditySide::Taker,
             event_type: PolymarketEventType::Trade,
         };
@@ -2480,6 +2497,7 @@ mod tests {
             taker_order_id: venue_order_id.as_str().to_string(),
             timestamp: "1700000000000".to_string(),
             trade_owner: Ustr::from("00000000-0000-0000-0000-000000000001"),
+            transaction_hash: None,
             trader_side: PolymarketLiquiditySide::Taker,
             event_type: PolymarketEventType::Trade,
         };
@@ -2621,6 +2639,7 @@ mod tests {
             taker_order_id: venue_order_id.as_str().to_string(),
             timestamp: "1700000000000".to_string(),
             trade_owner: Ustr::from("00000000-0000-0000-0000-000000000001"),
+            transaction_hash: None,
             trader_side: PolymarketLiquiditySide::Taker,
             event_type: PolymarketEventType::Trade,
         };

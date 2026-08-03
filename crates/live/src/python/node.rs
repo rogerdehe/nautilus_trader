@@ -24,7 +24,7 @@ use nautilus_common::{
     live::get_runtime,
     logging::logger::LoggerConfig,
     python::{
-        actor::{PyDataActor, register_python_exec_algorithm_endpoint},
+        actor::{PyDataActor, PyDataActorInner, register_python_exec_algorithm_endpoint},
         cache::PyCache,
     },
 };
@@ -433,7 +433,7 @@ impl LiveNode {
         self.kernel_mut()
             .trader
             .borrow_mut()
-            .add_actor_id_for_lifecycle(actor_id)
+            .add_actor_id_for_lifecycle::<PyDataActorInner>(actor_id)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python actor {actor_id}");
@@ -742,7 +742,7 @@ impl LiveNode {
                 })?;
 
             if let Some(config) = config.as_ref() {
-                configure_py_execution_algorithm(&mut py_exec_algorithm_ref, config)?;
+                py_exec_algorithm_ref.configure_from_py_config(config)?;
             }
 
             py_exec_algorithm_ref.set_python_instance(exec_algorithm.clone_ref(py));
@@ -812,7 +812,7 @@ impl LiveNode {
                     python_exec_algorithm.extract::<PyRefMut<PyExecutionAlgorithm>>()
                 {
                     if let Some(config_obj) = config_instance.as_ref() {
-                        configure_py_execution_algorithm(&mut py_exec_algorithm_ref, config_obj)?;
+                        py_exec_algorithm_ref.configure_from_py_config(config_obj)?;
                     }
 
                     py_exec_algorithm_ref
@@ -951,11 +951,11 @@ impl LiveNode {
         Ok(())
     }
 
-    /// Rejects plug-in registration when host support is not linked.
+    /// Loads and registers one plug-in instance.
     ///
     /// # Errors
     ///
-    /// Always returns an error explaining that host-side support is required.
+    /// Returns an error because dynamic plug-in hosting lives in the host-side integration.
     #[pyo3(name = "add_plugin", signature = (path, type_name, config=None, sha256=None))]
     fn py_add_plugin(
         &mut self,
@@ -1667,40 +1667,6 @@ fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option
         .and_then(|val| val.extract::<bool>().ok())
 }
 
-fn configure_py_execution_algorithm(
-    py_exec_algorithm_ref: &mut PyRefMut<'_, PyExecutionAlgorithm>,
-    config_obj: &Bound<'_, PyAny>,
-) -> anyhow::Result<()> {
-    let id_attr = config_obj
-        .getattr("exec_algorithm_id")
-        .ok()
-        .filter(|v| !v.is_none())
-        .or_else(|| config_obj.getattr("actor_id").ok().filter(|v| !v.is_none()));
-
-    if let Some(id_value) = id_attr {
-        let exec_algorithm_id = if let Ok(eaid) = id_value.extract::<ExecAlgorithmId>() {
-            eaid
-        } else if let Ok(aid) = id_value.extract::<ActorId>() {
-            ExecAlgorithmId::new_checked(aid.inner().as_str())?
-        } else if let Ok(id_str) = id_value.extract::<String>() {
-            ExecAlgorithmId::new_checked(&id_str)?
-        } else {
-            anyhow::bail!("Invalid `exec_algorithm_id`/`actor_id` type");
-        };
-        py_exec_algorithm_ref.set_exec_algorithm_id(exec_algorithm_id);
-    }
-
-    if let Some(val) = extract_bool_config_attr(config_obj, "log_events") {
-        py_exec_algorithm_ref.set_log_events(val);
-    }
-
-    if let Some(val) = extract_bool_config_attr(config_obj, "log_commands") {
-        py_exec_algorithm_ref.set_log_commands(val);
-    }
-
-    Ok(())
-}
-
 fn extract_external_order_claims_config_attr(
     config_obj: &Bound<'_, PyAny>,
 ) -> anyhow::Result<Option<Vec<InstrumentId>>> {
@@ -1763,8 +1729,8 @@ mod tests {
             data::{BarsResponse, RequestBars},
             execution::{CancelAllOrders, SubmitOrder, TradingCommand},
         },
-        msgbus::get_message_bus,
-        runner::get_trading_cmd_sender,
+        msgbus::{MessagingSwitchboard, get_message_bus},
+        runner::{TradingCommandMessage, get_trading_cmd_sender},
     };
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_execution::engine::stubs::StubExecutionClient;
@@ -1818,8 +1784,9 @@ mod tests {
 
     impl DataActor for ShutdownCancelStrategy {
         fn on_stop(&mut self) -> anyhow::Result<()> {
-            get_trading_cmd_sender().execute(TradingCommand::CancelAllOrders(
-                CancelAllOrders::new(
+            get_trading_cmd_sender().execute(TradingCommandMessage::new(
+                MessagingSwitchboard::exec_engine_execute(),
+                TradingCommand::CancelAllOrders(CancelAllOrders::new(
                     TraderId::from("TESTER-001"),
                     None,
                     StrategyId::from("SHUTDOWN-CANCEL-001"),
@@ -1829,7 +1796,7 @@ mod tests {
                     UnixNanos::default(),
                     None,
                     None,
-                ),
+                )),
             ));
             Ok(())
         }

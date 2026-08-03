@@ -48,7 +48,7 @@ requires = [
   "setuptools>=83",
   "poetry-core==2.3.1", # Pinned to 2.3.1 for stability
   "numpy>=1.26.4",
-  "cython==3.2.8", # Pinned to 3.2.8 for stability
+  "cython==3.2.9", # Pinned to 3.2.9 for stability
 ]
 build-backend = "poetry.core.masonry.api"
 
@@ -91,12 +91,12 @@ visualization = [
 
 [dependency-groups]
 dev = [
-  "cython==3.2.8", # Pinned to 3.2.8 for stability
+  "cython==3.2.9", # Pinned to 3.2.9 for stability
   "jupytext>=1.19.3,<2.0.0",
   "setuptools>=83",
   "mypy==1.20.2,<2.0.0", # Pinned to 1.20.2 (keep in line with .pre-commit-config.yaml)
   "pandas-stubs>=2.3.3,<4.0.0",
-  "ruff==0.15.22", # Pinned to 0.15.22 (keep in line with .pre-commit-config.yaml)
+  "ruff==0.16.0", # Pinned to 0.16.0 (keep in line with .pre-commit-config.yaml)
   "types-pytz>=2026.2,<2027.0",
   "types-toml>=0.10.8,<1.0.0",
 ]
@@ -122,7 +122,7 @@ docs = [
 ]
 
 [tool.uv]
-required-version = "==0.11.29"
+required-version = "==0.11.33"
 exclude-newer = "3 days"
 # Block sdist builds for every third-party package in uv.lock so unexpected loss
 # of wheel publishing fails `uv lock` instead of silently building from source.
@@ -380,6 +380,8 @@ ignore = [
   "E501", # Line too long (will lint separately)
   "E741", # Ambiguous variable name (single char)
   "FURB166", # int() on sliced str (explicit base is clearer than auto-detection)
+  "ISC004", # multi-line string concatenation in collections is intentional for wrapped messages
+  "LOG004", # custom Logger.exception accepts an explicit exception outside handlers
   "PERF401", # manual-list-comprehension (16 violations - fix incrementally)
   "PERF402", # manual-list-copy (3 violations - fix incrementally)
   "PT007", # pytest-parametrize-values-wrong-type (1621 violations - deferred)

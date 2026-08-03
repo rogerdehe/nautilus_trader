@@ -317,15 +317,34 @@ impl TryFrom<OrderSide> for AxOrderSide {
     }
 }
 
-/// Trade side as returned in private WebSocket execution details.
+/// How a perpetual symbol's funding accrues over a trading day.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/get-funding-slots>
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AxTradeSide {
-    /// Buy execution.
-    #[serde(rename = "Buy")]
-    Buy,
-    /// Sell execution.
-    #[serde(rename = "Sell")]
-    Sell,
+#[serde(rename_all = "snake_case")]
+pub enum AxFundingVariant {
+    /// A single settlement at the trading-day close.
+    DailyClose,
+    /// A fixed number of intraday slots, each charging its share of the day's TWAP premium.
+    IntradayTwap,
+}
+
+/// Status of one funding slot within a `GET /funding-slots` trading day.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/get-funding-slots>
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxFundingSlotStatus {
+    /// Slot funding has settled.
+    Realized,
+    /// Slot funding is forecast from current mark and underlying TWAPs.
+    Projected,
+    /// Slot did not settle (for example a holiday or suspension); see the slot `reason`.
+    Skipped,
+    /// Slot is scheduled but not yet realized or projected.
+    Pending,
 }
 
 /// Order status as returned by the AX Exchange API.
@@ -981,14 +1000,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(AxTradeSide::Buy, "\"Buy\"")]
-    #[case(AxTradeSide::Sell, "\"Sell\"")]
-    fn test_trade_side_serialization(#[case] side: AxTradeSide, #[case] expected: &str) {
-        let json = serde_json::to_string(&side).unwrap();
-        assert_eq!(json, expected);
-
-        let parsed: AxTradeSide = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, side);
+    #[case("\"Buy\"")]
+    #[case("\"Sell\"")]
+    fn test_order_side_rejects_long_form(#[case] json: &str) {
+        let error = serde_json::from_str::<AxOrderSide>(json).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
     }
 
     #[rstest]

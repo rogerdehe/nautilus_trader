@@ -15,20 +15,21 @@
 
 //! Live execution client implementation for the Polymarket adapter.
 
+pub mod order_builder;
+pub mod parse;
+
+pub(crate) mod identity;
+pub(crate) mod order_fill_tracker;
+pub(crate) mod pending;
+pub(crate) mod reconciliation;
+pub(crate) mod submitter;
+pub(crate) mod types;
+
 mod cancellations;
 mod lifecycle;
 mod orders;
 mod reports;
 mod responses;
-
-pub(crate) mod identity;
-pub mod order_builder;
-pub(crate) mod order_fill_tracker;
-pub mod parse;
-pub(crate) mod pending;
-pub(crate) mod reconciliation;
-pub(crate) mod submitter;
-pub(crate) mod types;
 
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
@@ -36,6 +37,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
+    live::task::TaskHandles,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -63,6 +65,7 @@ use nautilus_model::{
 use nautilus_network::retry::RetryConfig;
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 pub(crate) use self::reports::get_pusd_currency;
@@ -93,9 +96,11 @@ pub struct PolymarketExecutionClient {
     submitter: OrderSubmitter,
     ws_client: PolymarketWebSocketClient,
     secrets: Secrets,
-    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pending_tasks: Arc<TaskHandles>,
     stopping: Arc<AtomicBool>,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    ws_stream_handle: Option<JoinHandle<()>>,
+    heartbeat_task: Option<HeartbeatTask>,
+    heartbeat_healthy: Arc<AtomicBool>,
     order_event_handler: Option<TypedHandler<OrderEventAny>>,
     position_event_handler: Option<TypedHandler<PositionEvent>>,
     shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -117,6 +122,7 @@ impl PolymarketExecutionClient {
         core: ExecutionClientCore,
         config: PolymarketExecClientConfig,
     ) -> anyhow::Result<Self> {
+        let proxy_url = config.validated_proxy_url()?;
         let secrets = Secrets::resolve(
             config.private_key.as_deref(),
             config.api_key.clone(),
@@ -132,19 +138,23 @@ impl PolymarketExecutionClient {
             &signer_address,
             secrets.funder.as_deref(),
         )?;
-        let http_client = PolymarketClobHttpClient::new(
+        let http_client = PolymarketClobHttpClient::new_with_proxy(
             secrets.credential.clone(),
             signer_address.clone(),
             config.base_url_http.clone(),
             config.http_timeout_secs,
+            proxy_url.clone(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to create CLOB HTTP client")?;
 
-        let data_api_client =
-            PolymarketDataApiHttpClient::new(Some(config.data_api_url()), config.http_timeout_secs)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("failed to create Data API HTTP client")?;
+        let data_api_client = PolymarketDataApiHttpClient::new_with_proxy(
+            Some(config.data_api_url()),
+            config.http_timeout_secs,
+            proxy_url.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to create Data API HTTP client")?;
 
         let order_signer =
             OrderSigner::new(&secrets.private_key).context("failed to create order signer")?;
@@ -167,10 +177,11 @@ impl PolymarketExecutionClient {
         };
         let submitter = OrderSubmitter::new(http_client.clone(), order_builder, retry_config);
 
-        let ws_client = PolymarketWebSocketClient::new_user(
+        let ws_client = PolymarketWebSocketClient::new_user_with_proxy(
             config.base_url_ws.clone(),
             secrets.credential.clone(),
             config.transport_backend,
+            proxy_url,
         );
 
         let clock = get_atomic_clock_realtime();
@@ -193,9 +204,11 @@ impl PolymarketExecutionClient {
             submitter,
             ws_client,
             secrets,
-            pending_tasks: Arc::new(Mutex::new(Vec::new())),
+            pending_tasks: Arc::new(TaskHandles::default()),
             stopping: Arc::new(AtomicBool::new(false)),
-            ws_stream_handle: Mutex::new(None),
+            ws_stream_handle: None,
+            heartbeat_task: None,
+            heartbeat_healthy: Arc::new(AtomicBool::new(true)),
             order_event_handler: None,
             position_event_handler: None,
             shared_token_instruments: Arc::new(AtomicMap::new()),
@@ -207,6 +220,12 @@ impl PolymarketExecutionClient {
             ws_dispatch_state: Arc::new(Mutex::new(WsDispatchState::default())),
         })
     }
+}
+
+#[derive(Debug)]
+struct HeartbeatTask {
+    cancellation: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 fn resolve_maker_address(
@@ -238,6 +257,10 @@ fn resolve_maker_address(
 impl ExecutionClient for PolymarketExecutionClient {
     fn is_connected(&self) -> bool {
         self.core.is_connected()
+            && (!self.config.heartbeat_enabled
+                || self
+                    .heartbeat_healthy
+                    .load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn client_id(&self) -> ClientId {

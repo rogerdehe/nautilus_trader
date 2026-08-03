@@ -23,8 +23,8 @@ from nautilus_trader.common.actor import Actor
 
 
 class MyActorConfig(ActorConfig):
-    instrument_id: InstrumentId   # example value: "ETHUSDT-PERP.BINANCE"
-    bar_type: BarType             # example value: "ETHUSDT-PERP.BINANCE-15-MINUTE[LAST]-INTERNAL"
+    instrument_id: InstrumentId  # example value: "ETHUSDT-PERP.BINANCE"
+    bar_type: BarType  # example value: "ETHUSDT-PERP.BINANCE-15-MINUTE[LAST]-INTERNAL"
     lookback_period: int = 10
 
 
@@ -86,15 +86,15 @@ stateDiagram-v2
 
 Override these methods to hook into lifecycle events:
 
-| Method          | When called                                                         |
-|-----------------|---------------------------------------------------------------------|
-| `on_start()`    | Actor is starting (subscribe to data here).                         |
-| `on_stop()`     | Actor is stopping (cancel timers, clean up resources).              |
-| `on_resume()`   | Actor is resuming from a stopped state.                             |
-| `on_reset()`    | Reset indicators and internal state (called between backtest runs). |
-| `on_degrade()`  | Actor is entering a degraded state (partial functionality).         |
-| `on_fault()`    | Actor has encountered a fault.                                      |
-| `on_dispose()`  | Actor is being disposed (final cleanup).                            |
+| Method         | When called                                                         |
+| -------------- | ------------------------------------------------------------------- |
+| `on_start()`   | Actor is starting (subscribe to data here).                         |
+| `on_stop()`    | Actor is stopping (cancel timers, clean up resources).              |
+| `on_resume()`  | Actor is resuming from a stopped state.                             |
+| `on_reset()`   | Reset indicators and internal state (called between backtest runs). |
+| `on_degrade()` | Actor is entering a degraded state (partial functionality).         |
+| `on_fault()`   | Actor has encountered a fault.                                      |
+| `on_dispose()` | Actor is being disposed (final cleanup).                            |
 
 ## Timers and alerts
 
@@ -116,12 +116,15 @@ def on_start(self) -> None:
         callback=self._on_alert,
     )
 
+
 def on_stop(self) -> None:
     # Cancel timers to prevent resource leaks across stop/resume cycles
     self.clock.cancel_timer("my_timer")
 
+
 def _on_timer(self, event: TimeEvent) -> None:
     self.log.info("Timer fired!")
+
 
 def _on_alert(self, event: TimeEvent) -> None:
     self.log.info("Alert triggered!")
@@ -134,13 +137,13 @@ omit the callback, the event is delivered to `on_event` instead.
 
 Actors have access to core system components:
 
-| Property          | Description                                              |
-|-------------------|----------------------------------------------------------|
-| `self.cache`      | Shared state for instruments, orders, positions, etc.    |
-| `self.portfolio`  | Portfolio state and calculations.                        |
-| `self.clock`      | Current time and timer/alert scheduling.                 |
-| `self.log`        | Structured logging.                                      |
-| `self.msgbus`     | Publish/subscribe to custom messages.                    |
+| Property         | Description                                           |
+| ---------------- | ----------------------------------------------------- |
+| `self.cache`     | Shared state for instruments, orders, positions, etc. |
+| `self.portfolio` | Portfolio state and calculations.                     |
+| `self.clock`     | Current time and timer/alert scheduling.              |
+| `self.log`       | Structured logging.                                   |
+| `self.msgbus`    | Publish/subscribe to custom messages.                 |
 
 For custom messaging between components, see the [Message Bus](message_bus.md) guide.
 
@@ -167,35 +170,35 @@ The system distinguishes between two data flows:
 
 Different data operations map to these handlers:
 
-| Operation                            | Category   | Handler                  | Purpose                                           |
-|--------------------------------------|------------|--------------------------|---------------------------------------------------|
-| `subscribe_data()`                   | Real‑time  | `on_data()`              | Live data updates.                                |
-| `subscribe_instrument()`             | Real‑time  | `on_instrument()`        | Live instrument definition updates.               |
-| `subscribe_instruments()`            | Real‑time  | `on_instrument()`        | Live instrument definition updates (for venue).   |
-| `subscribe_order_book_deltas()`      | Real‑time  | `on_order_book_deltas()` | Live order book deltas.                           |
-| `subscribe_order_book_depth()`       | Real‑time  | `on_order_book_depth()`  | Live order book depth snapshots.                  |
-| `subscribe_order_book_at_interval()` | Real‑time  | `on_order_book()`        | Live order book snapshots at intervals.           |
-| `subscribe_quote_ticks()`            | Real‑time  | `on_quote_tick()`        | Live quote updates.                               |
-| `subscribe_trade_ticks()`            | Real‑time  | `on_trade_tick()`        | Live trade updates.                               |
-| `subscribe_mark_prices()`            | Real‑time  | `on_mark_price()`        | Live mark price updates.                          |
-| `subscribe_index_prices()`           | Real‑time  | `on_index_price()`       | Live index price updates.                         |
-| `subscribe_bars()`                   | Real‑time  | `on_bar()`               | Live bar updates.                                 |
-| `subscribe_funding_rates()`          | Real‑time  | `on_funding_rate()`      | Live funding rate updates.                        |
-| `subscribe_instrument_status()`      | Real‑time  | `on_instrument_status()` | Live instrument status updates.                   |
-| `subscribe_instrument_close()`       | Real‑time  | `on_instrument_close()`  | Live instrument close updates.                    |
-| `subscribe_option_greeks()`          | Real‑time  | `on_option_greeks()`     | Live option greeks updates.                       |
-| `subscribe_option_chain()`           | Real‑time  | `on_option_chain()`      | Live option chain slice snapshots.                |
-| `request_data()`                     | Historical | `on_historical_data()`   | Historical data processing.                       |
-| `request_order_book_deltas()`        | Historical | `on_historical_data()`   | Historical order book deltas.                     |
-| `request_order_book_depth()`         | Historical | `on_historical_data()`   | Historical order book depth.                      |
-| `request_order_book_snapshot()`      | Historical | `on_historical_data()`   | Historical order book snapshot.                   |
-| `request_instrument()`               | Historical | `on_instrument()`        | Instrument definition.                            |
-| `request_instruments()`              | Historical | `on_instrument()`        | Instrument definitions.                           |
-| `request_quote_ticks()`              | Historical | `on_historical_data()`   | Historical quotes processing.                     |
-| `request_trade_ticks()`              | Historical | `on_historical_data()`   | Historical trades processing.                     |
-| `request_bars()`                     | Historical | `on_historical_data()`   | Historical bars processing.                       |
-| `request_aggregated_bars()`          | Historical | `on_historical_data()`   | Historical aggregated bars (on‑the‑fly).          |
-| `request_funding_rates()`            | Historical | `on_historical_data()`   | Historical funding rates processing.              |
+| Operation                            | Category   | Handler                  | Purpose                                         |
+| ------------------------------------ | ---------- | ------------------------ | ----------------------------------------------- |
+| `subscribe_data()`                   | Real‑time  | `on_data()`              | Live data updates.                              |
+| `subscribe_instrument()`             | Real‑time  | `on_instrument()`        | Live instrument definition updates.             |
+| `subscribe_instruments()`            | Real‑time  | `on_instrument()`        | Live instrument definition updates (for venue). |
+| `subscribe_order_book_deltas()`      | Real‑time  | `on_order_book_deltas()` | Live order book deltas.                         |
+| `subscribe_order_book_depth()`       | Real‑time  | `on_order_book_depth()`  | Live order book depth snapshots.                |
+| `subscribe_order_book_at_interval()` | Real‑time  | `on_order_book()`        | Live order book snapshots at intervals.         |
+| `subscribe_quote_ticks()`            | Real‑time  | `on_quote_tick()`        | Live quote updates.                             |
+| `subscribe_trade_ticks()`            | Real‑time  | `on_trade_tick()`        | Live trade updates.                             |
+| `subscribe_mark_prices()`            | Real‑time  | `on_mark_price()`        | Live mark price updates.                        |
+| `subscribe_index_prices()`           | Real‑time  | `on_index_price()`       | Live index price updates.                       |
+| `subscribe_bars()`                   | Real‑time  | `on_bar()`               | Live bar updates.                               |
+| `subscribe_funding_rates()`          | Real‑time  | `on_funding_rate()`      | Live funding rate updates.                      |
+| `subscribe_instrument_status()`      | Real‑time  | `on_instrument_status()` | Live instrument status updates.                 |
+| `subscribe_instrument_close()`       | Real‑time  | `on_instrument_close()`  | Live instrument close updates.                  |
+| `subscribe_option_greeks()`          | Real‑time  | `on_option_greeks()`     | Live option greeks updates.                     |
+| `subscribe_option_chain()`           | Real‑time  | `on_option_chain()`      | Live option chain slice snapshots.              |
+| `request_data()`                     | Historical | `on_historical_data()`   | Historical data processing.                     |
+| `request_order_book_deltas()`        | Historical | `on_historical_data()`   | Historical order book deltas.                   |
+| `request_order_book_depth()`         | Historical | `on_historical_data()`   | Historical order book depth.                    |
+| `request_order_book_snapshot()`      | Historical | `on_historical_data()`   | Historical order book snapshot.                 |
+| `request_instrument()`               | Historical | `on_instrument()`        | Instrument definition.                          |
+| `request_instruments()`              | Historical | `on_instrument()`        | Instrument definitions.                         |
+| `request_quote_ticks()`              | Historical | `on_historical_data()`   | Historical quotes processing.                   |
+| `request_trade_ticks()`              | Historical | `on_historical_data()`   | Historical trades processing.                   |
+| `request_bars()`                     | Historical | `on_historical_data()`   | Historical bars processing.                     |
+| `request_aggregated_bars()`          | Historical | `on_historical_data()`   | Historical aggregated bars (on‑the‑fly).        |
+| `request_funding_rates()`            | Historical | `on_historical_data()`   | Historical funding rates processing.            |
 
 ### Example
 
@@ -211,7 +214,7 @@ from nautilus_trader.model import ClientId, InstrumentId
 
 class MyActorConfig(ActorConfig):
     instrument_id: InstrumentId  # example value: "AAPL.XNAS"
-    bar_type: BarType            # example value: "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL"
+    bar_type: BarType  # example value: "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL"
 
 
 class MyActor(Actor):
@@ -224,11 +227,11 @@ class MyActor(Actor):
         self.request_bars(
             bar_type=self.bar_type,
             # Many optional parameters
-            start=None,                # pd.Timestamp | None
-            end=None,                  # pd.Timestamp | None
-            callback=None,             # Callable[[UUID4], None] | None
+            start=None,  # pd.Timestamp | None
+            end=None,  # pd.Timestamp | None
+            callback=None,  # Callable[[UUID4], None] | None
             update_catalog_mode=None,  # UpdateCatalogMode | None
-            params=None,               # dict[str, Any] | None
+            params=None,  # dict[str, Any] | None
         )
 
         # Subscribe to real-time data - will be processed by on_bar() handler
@@ -236,7 +239,7 @@ class MyActor(Actor):
             bar_type=self.bar_type,
             # Many optional parameters
             client_id=None,  # ClientId, optional
-            params=None,     # dict[str, Any], optional
+            params=None,  # dict[str, Any], optional
         )
 
     def on_historical_data(self, data: Data) -> None:
@@ -279,7 +282,7 @@ keeps direct message bus subscriptions aligned with the actor lifecycle.
 Common order event topics:
 
 | Topic pattern                           | Receives                                 |
-|-----------------------------------------|------------------------------------------|
+| --------------------------------------- | ---------------------------------------- |
 | `events.order_filled.{instrument_id}`   | Fill events for one instrument.          |
 | `events.order_canceled.{instrument_id}` | Cancel events for one instrument.        |
 | `events.order.{strategy_id}`            | All order events routed to one strategy. |
@@ -375,8 +378,7 @@ class StrategyOrderMonitorActor(Actor):
         self.order_event_count += 1
 
         self.log.info(
-            f"Order event received: {type(event).__name__}, "
-            f"Total events: {self.order_event_count}"
+            f"Order event received: {type(event).__name__}, Total events: {self.order_event_count}"
         )
 ```
 

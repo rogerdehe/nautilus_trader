@@ -8,7 +8,7 @@ order fills produce position events.
 ## Event categories
 
 | Category | Examples                                        | Origin                          |
-|----------|-------------------------------------------------|---------------------------------|
+| -------- | ----------------------------------------------- | ------------------------------- |
 | Order    | `OrderAccepted`, `OrderFilled`, `OrderCanceled` | `ExecutionEngine` (from venue)  |
 | Position | `PositionOpened`, `PositionChanged`             | `ExecutionEngine` (from fills)  |
 | Account  | `AccountState`                                  | `ExecutionClient` / `Portfolio` |
@@ -36,7 +36,8 @@ can handle events at whatever granularity you need.
 
 Timers and alerts produce `TimeEvent` objects. Pass a `callback` when calling
 `set_timer` or `set_time_alert` to direct events to your own method. If you
-omit the callback, the event is delivered to `on_event` instead.
+omit the callback, a callback previously registered under the same name is
+used when present; otherwise the event is delivered to `on_event` instead.
 
 ## Order events
 
@@ -48,7 +49,7 @@ and triggered orders support additional transitions documented in the full
 [order state flow](../orders/index.md#order-state-flow).
 
 | Event                                             | Primary transition                                | Handler                    |
-|---------------------------------------------------|---------------------------------------------------|----------------------------|
+| ------------------------------------------------- | ------------------------------------------------- | -------------------------- |
 | [`OrderInitialized`](order_initialized.md)        | (created locally)                                 | `on_order_initialized`     |
 | [`OrderDenied`](order_denied.md)                  | Initialized -> Denied                             | `on_order_denied`          |
 | [`OrderEmulated`](order_emulated.md)              | Initialized -> Emulated                           | `on_order_emulated`        |
@@ -71,18 +72,18 @@ and triggered orders support additional transitions documented in the full
 
 All order events share these fields:
 
-| Field              | Description                              |
-|--------------------|------------------------------------------|
-| `trader_id`        | Trader instance identifier.              |
-| `strategy_id`      | Strategy that submitted the order.       |
-| `instrument_id`    | Instrument for the order.                |
-| `client_order_id`  | Client‑assigned order identifier.        |
-| `venue_order_id`   | Venue‑assigned order identifier.         |
-| `account_id`       | Account the order belongs to.            |
-| `reconciliation`   | Whether generated during reconciliation. |
-| `event_id`         | Unique event identifier.                 |
-| `ts_event`         | Timestamp when the event occurred.       |
-| `ts_init`          | Timestamp when the event was created.    |
+| Field             | Description                              |
+| ----------------- | ---------------------------------------- |
+| `trader_id`       | Trader instance identifier.              |
+| `strategy_id`     | Strategy that submitted the order.       |
+| `instrument_id`   | Instrument for the order.                |
+| `client_order_id` | Client‑assigned order identifier.        |
+| `venue_order_id`  | Venue‑assigned order identifier.         |
+| `account_id`      | Account the order belongs to.            |
+| `reconciliation`  | Whether generated during reconciliation. |
+| `event_id`        | Unique event identifier.                 |
+| `ts_event`        | Timestamp when the event occurred.       |
+| `ts_init`         | Timestamp when the event was created.    |
 
 Each order event's page lists the type-specific fields it adds beyond this
 common set, plus which optional common fields are populated. For example,
@@ -105,7 +106,7 @@ An `OrderFillVoided` rebuilds the cached position from its effective fill histor
 an opposite fill or synthesize a position event.
 
 | Event                                    | When it fires                             | Handler               |
-|------------------------------------------|-------------------------------------------|-----------------------|
+| ---------------------------------------- | ----------------------------------------- | --------------------- |
 | [`PositionOpened`](position_opened.md)   | First fill creates a new position.        | `on_position_opened`  |
 | [`PositionChanged`](position_changed.md) | Subsequent fill changes quantity or side. | `on_position_changed` |
 | [`PositionClosed`](position_closed.md)   | Fill reduces quantity to zero.            | `on_position_closed`  |
@@ -168,34 +169,34 @@ base). A check mark means the field carries a meaningful value for that event; a
 it is left at its zero or default (for example `avg_px_close` and `duration_ns` before a
 position closes).
 
-| Field                | Opened | Changed | Closed | Description                       |
-|----------------------|--------|---------|--------|-----------------------------------|
-| `trader_id`          | ✓      | ✓       | ✓      | Trader instance identifier.       |
-| `strategy_id`        | ✓      | ✓       | ✓      | Strategy that owns the position.  |
-| `instrument_id`      | ✓      | ✓       | ✓      | Instrument for the position.      |
-| `position_id`        | ✓      | ✓       | ✓      | Unique position identifier.       |
-| `account_id`         | ✓      | ✓       | ✓      | Account the position belongs to.  |
-| `opening_order_id`   | ✓      | ✓       | ✓      | Order that opened the position.   |
-| `closing_order_id`   | -      | -       | ✓      | Order that closed the position.   |
-| `entry`              | ✓      | ✓       | ✓      | Side of the opening fill.         |
-| `side`               | ✓      | ✓       | ✓      | Current position side.            |
-| `signed_qty`         | ✓      | ✓       | ✓      | Signed quantity (negative=short). |
-| `quantity`           | ✓      | ✓       | ✓      | Unsigned position quantity.       |
-| `peak_qty`           | ✓      | ✓       | ✓      | Largest quantity held.            |
-| `last_qty`           | ✓      | ✓       | ✓      | Quantity of the last fill.        |
-| `last_px`            | ✓      | ✓       | ✓      | Price of the last fill.           |
-| `currency`           | ✓      | ✓       | ✓      | Settlement currency.              |
-| `avg_px_open`        | ✓      | ✓       | ✓      | Average entry price.              |
-| `avg_px_close`       | -      | ✓       | ✓      | Average exit price.               |
-| `realized_return`    | -      | ✓       | ✓      | Realized return as a ratio.       |
-| `realized_pnl`       | ✓      | ✓       | ✓      | Realized profit and loss.         |
-| `unrealized_pnl`     | -      | ✓       | ✓      | Unrealized profit and loss.       |
-| `duration_ns`        | -      | -       | ✓      | Time held in nanoseconds.         |
-| `ts_opened`          | ✓      | ✓       | ✓      | Timestamp when position opened.   |
-| `ts_closed`          | -      | -       | ✓      | Timestamp when position closed.   |
-| `event_id`           | ✓      | ✓       | ✓      | Unique event identifier.          |
-| `ts_event`           | ✓      | ✓       | ✓      | Timestamp of the triggering fill. |
-| `ts_init`            | ✓      | ✓       | ✓      | Timestamp when event was created. |
+| Field              | Opened | Changed | Closed | Description                       |
+| ------------------ | ------ | ------- | ------ | --------------------------------- |
+| `trader_id`        | ✓      | ✓       | ✓      | Trader instance identifier.       |
+| `strategy_id`      | ✓      | ✓       | ✓      | Strategy that owns the position.  |
+| `instrument_id`    | ✓      | ✓       | ✓      | Instrument for the position.      |
+| `position_id`      | ✓      | ✓       | ✓      | Unique position identifier.       |
+| `account_id`       | ✓      | ✓       | ✓      | Account the position belongs to.  |
+| `opening_order_id` | ✓      | ✓       | ✓      | Order that opened the position.   |
+| `closing_order_id` | -      | -       | ✓      | Order that closed the position.   |
+| `entry`            | ✓      | ✓       | ✓      | Side of the opening fill.         |
+| `side`             | ✓      | ✓       | ✓      | Current position side.            |
+| `signed_qty`       | ✓      | ✓       | ✓      | Signed quantity (negative=short). |
+| `quantity`         | ✓      | ✓       | ✓      | Unsigned position quantity.       |
+| `peak_qty`         | ✓      | ✓       | ✓      | Largest quantity held.            |
+| `last_qty`         | ✓      | ✓       | ✓      | Quantity of the last fill.        |
+| `last_px`          | ✓      | ✓       | ✓      | Price of the last fill.           |
+| `currency`         | ✓      | ✓       | ✓      | Settlement currency.              |
+| `avg_px_open`      | ✓      | ✓       | ✓      | Average entry price.              |
+| `avg_px_close`     | -      | ✓       | ✓      | Average exit price.               |
+| `realized_return`  | -      | ✓       | ✓      | Realized return as a ratio.       |
+| `realized_pnl`     | ✓      | ✓       | ✓      | Realized profit and loss.         |
+| `unrealized_pnl`   | -      | ✓       | ✓      | Unrealized profit and loss.       |
+| `duration_ns`      | -      | -       | ✓      | Time held in nanoseconds.         |
+| `ts_opened`        | ✓      | ✓       | ✓      | Timestamp when position opened.   |
+| `ts_closed`        | -      | -       | ✓      | Timestamp when position closed.   |
+| `event_id`         | ✓      | ✓       | ✓      | Unique event identifier.          |
+| `ts_event`         | ✓      | ✓       | ✓      | Timestamp of the triggering fill. |
+| `ts_init`          | ✓      | ✓       | ✓      | Timestamp when event was created. |
 
 ### Tracing orders to positions
 
@@ -232,7 +233,7 @@ instruments they do not trade. These subscriptions use the `MessageBus`
 directly and do not involve the `DataEngine`.
 
 | Topic pattern                           | Receives                                 |
-|-----------------------------------------|------------------------------------------|
+| --------------------------------------- | ---------------------------------------- |
 | `events.order_filled.{instrument_id}`   | Fill events for one instrument.          |
 | `events.order_canceled.{instrument_id}` | Cancel events for one instrument.        |
 | `events.order.{strategy_id}`            | All order events routed to one strategy. |

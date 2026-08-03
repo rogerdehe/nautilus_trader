@@ -9,7 +9,7 @@ Examples include non-crypto perpetual contracts and venue-specific synthetic swa
 ## Fields
 
 | Field                 | Rust type          | Python type        | Required/default | Notes                                    |
-|-----------------------|--------------------|--------------------|------------------|------------------------------------------|
+| --------------------- | ------------------ | ------------------ | ---------------- | ---------------------------------------- |
 | `instrument_id`       | `InstrumentId`     | `InstrumentId`     | Required         | Stored as `id` in Rust.                  |
 | `raw_symbol`          | `Symbol`           | `Symbol`           | Required         | Native venue symbol.                     |
 | `underlying`          | `Ustr`             | `str`              | Required         | Underlying asset or reference market.    |
@@ -123,6 +123,7 @@ eurusd_perp = PerpetualContract(
 Representative adapters that create or consume `PerpetualContract` instruments include:
 
 - [Architect AX](../../integrations/architect_ax.md) for venue-defined perpetual contracts.
+- [Binance](../../integrations/binance.md) for USD-M TradFi perpetual contracts.
 
 ## Related guides
 

@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     rc::Rc,
@@ -91,6 +91,14 @@ use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 
 const TEST_PRIVATE_KEY: &str = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const TEST_CHUNK_PRIVATE_KEY: &str =
+    "0x2234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const TEST_CANCEL_ALL_PRIVATE_KEY: &str =
+    "0x3234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const TEST_CHUNK_FAILURE_PRIVATE_KEY: &str =
+    "0x4234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const TEST_CHUNK_DOWNGRADE_PRIVATE_KEY: &str =
+    "0x5234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const TEST_SIGNER_ADDRESS: &str = "0x1be31a94361a391bbafb2a4ccd704f57dc04d4bb";
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 const DEFAULT_ACCEPTED_ORDER_ID: &str =
@@ -103,6 +111,14 @@ enum ShutdownCancelMode {
     Individual,
     CancelAll,
     Batch,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CancelChunkRetry {
+    None,
+    Succeeds,
+    Exhausts,
+    Downgrades,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -176,12 +192,22 @@ struct TestServerState {
     fee_rate_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     fee_rate_fetch_count: Arc<tokio::sync::Mutex<usize>>,
     fee_rate_overrides: Arc<tokio::sync::Mutex<HashMap<String, (StatusCode, Value)>>>,
+    heartbeat_response: Arc<tokio::sync::Mutex<Value>>,
+    heartbeat_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    heartbeat_response_statuses: Arc<tokio::sync::Mutex<VecDeque<StatusCode>>>,
+    heartbeat_post_count: Arc<AtomicUsize>,
+    heartbeat_resynchronize_remaining: Arc<AtomicUsize>,
+    heartbeat_request_gate: Arc<RequestGate>,
     cancel_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     cancel_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     cancel_request_gate: Arc<RequestGate>,
     batch_cancel_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     batch_cancel_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    batch_cancel_response_statuses: Arc<tokio::sync::Mutex<VecDeque<StatusCode>>>,
+    batch_cancel_response_headers: Arc<tokio::sync::Mutex<VecDeque<HeaderMap>>>,
+    batch_cancel_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    batch_cancel_echo_rejections: Arc<AtomicBool>,
     batch_cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     batch_cancel_request_gate: Arc<RequestGate>,
     order_request_gate: Arc<RequestGate>,
@@ -213,12 +239,24 @@ impl Default for TestServerState {
             fee_rate_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             fee_rate_fetch_count: Arc::new(tokio::sync::Mutex::new(0)),
             fee_rate_overrides: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            heartbeat_response: Arc::new(tokio::sync::Mutex::new(json!({
+                "heartbeat_id": "heartbeat-next",
+            }))),
+            heartbeat_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            heartbeat_response_statuses: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            heartbeat_post_count: Arc::new(AtomicUsize::new(0)),
+            heartbeat_resynchronize_remaining: Arc::new(AtomicUsize::new(0)),
+            heartbeat_request_gate: Arc::new(RequestGate::default()),
             cancel_response: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             cancel_request_gate: Arc::new(RequestGate::default()),
             batch_cancel_response: Arc::new(tokio::sync::Mutex::new(None)),
             batch_cancel_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            batch_cancel_response_statuses: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            batch_cancel_response_headers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            batch_cancel_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            batch_cancel_echo_rejections: Arc::new(AtomicBool::new(false)),
             batch_cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             batch_cancel_request_gate: Arc::new(RequestGate::default()),
             order_request_gate: Arc::new(RequestGate::default()),
@@ -287,36 +325,24 @@ fn create_test_execution_client(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("POLYMARKET-001");
-    let client_id = *POLYMARKET_CLIENT_ID;
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        *POLYMARKET_VENUE,
-        OmsType::Netting,
-        account_id,
-        AccountType::Cash,
-        None,
-        cache.clone(),
-    );
-
-    let config = create_test_exec_config(addr);
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    set_exec_event_sender(tx);
-
-    let client = PolymarketExecutionClient::new(core, config).unwrap();
-
-    (client, rx, cache)
+    create_test_execution_client_from_config(create_test_exec_config(addr))
 }
 
-fn create_test_execution_client_with_retries(
+fn create_test_execution_client_with_heartbeat(
     addr: SocketAddr,
-    max_retries: u32,
+    heartbeat_enabled: bool,
+) -> (
+    PolymarketExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    let mut config = create_test_exec_config(addr);
+    config.heartbeat_enabled = heartbeat_enabled;
+    create_test_execution_client_from_config(config)
+}
+
+fn create_test_execution_client_from_config(
+    config: PolymarketExecClientConfig,
 ) -> (
     PolymarketExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -339,14 +365,24 @@ fn create_test_execution_client_with_retries(
         cache.clone(),
     );
 
-    let config = create_test_exec_config_with_retries(addr, max_retries);
-
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     set_exec_event_sender(tx);
 
     let client = PolymarketExecutionClient::new(core, config).unwrap();
 
     (client, rx, cache)
+}
+
+fn create_test_execution_client_with_retries(
+    addr: SocketAddr,
+    max_retries: u32,
+) -> (
+    PolymarketExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    let config = create_test_exec_config_with_retries(addr, max_retries);
+    create_test_execution_client_from_config(config)
 }
 
 fn add_test_account_to_cache(cache: &Rc<RefCell<Cache>>, account_id: AccountId) {
@@ -525,19 +561,53 @@ async fn handle_delete_orders(State(state): State<TestServerState>, body: Bytes)
     *state.last_path.lock().await = "/orders".to_string();
     *state.batch_cancel_delete_count.lock().await += 1;
 
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-        *state.last_body.lock().await = Some(v);
+    let request = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(request) = &request {
+        *state.last_body.lock().await = Some(request.clone());
+        state.batch_cancel_bodies.lock().await.push(request.clone());
     }
 
     state.batch_cancel_request_gate.wait().await;
 
-    let status = *state.batch_cancel_response_status.lock().await;
-    let resp = state.batch_cancel_response.lock().await;
-    let body = resp
-        .clone()
-        .unwrap_or_else(|| load_json("http_batch_cancel_response.json"));
+    let status = if let Some(status) = state
+        .batch_cancel_response_statuses
+        .lock()
+        .await
+        .pop_front()
+    {
+        status
+    } else {
+        *state.batch_cancel_response_status.lock().await
+    };
+    let body = if state.batch_cancel_echo_rejections.load(Ordering::Acquire) {
+        let not_canceled = request
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|order_id| (order_id.to_string(), json!("order not found")))
+            .collect::<serde_json::Map<_, _>>();
+        json!({"canceled": [], "not_canceled": not_canceled})
+    } else {
+        state
+            .batch_cancel_response
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| load_json("http_batch_cancel_response.json"))
+    };
     record_canceled_order_ids(&state, &body).await;
-    (status, Json(body)).into_response()
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().extend(
+        state
+            .batch_cancel_response_headers
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or_default(),
+    );
+    response
 }
 
 async fn record_open_order_ids(state: &TestServerState, responses: &[Value]) {
@@ -621,6 +691,51 @@ async fn handle_get_fee_rate(
     (status, Json(body)).into_response()
 }
 
+async fn handle_heartbeat(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    *state.last_path.lock().await = "/heartbeats".to_string();
+    *state.last_headers.lock().await = headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.as_str().to_string(),
+                value.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+
+    if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+        *state.last_body.lock().await = Some(value);
+    }
+    state.heartbeat_post_count.fetch_add(1, Ordering::AcqRel);
+    state.heartbeat_request_gate.wait().await;
+
+    if state
+        .heartbeat_resynchronize_remaining
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"heartbeat_id": "heartbeat-resynchronized"})),
+        )
+            .into_response();
+    }
+
+    let status = if let Some(status) = state.heartbeat_response_statuses.lock().await.pop_front() {
+        status
+    } else {
+        *state.heartbeat_response_status.lock().await
+    };
+    let response = state.heartbeat_response.lock().await.clone();
+    (status, Json(response)).into_response()
+}
+
 async fn handle_health() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -647,6 +762,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/markets", get(handle_gamma_markets))
         .route("/book", get(handle_get_book))
         .route("/fee-rate", get(handle_get_fee_rate))
+        .route("/heartbeats", post(handle_heartbeat))
         .route("/health", get(handle_health))
         .route("/positions", get(handle_get_positions))
         .route("/ws", get(handle_user_upgrade))
@@ -782,6 +898,263 @@ async fn test_exec_client_not_connected_initially() {
     let (client, _rx, _cache) = create_test_execution_client(addr);
 
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_disabled_preserves_connection_behavior() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(client.is_connected());
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 0);
+
+    client.disconnect().await.unwrap();
+    assert!(!client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_starts_after_readiness_and_prevents_duplicate_tasks() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    client.start().unwrap();
+
+    let mut connect = Box::pin(client.connect());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), connect.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 0);
+
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    connect.await.unwrap();
+    await_heartbeat_posts(&state, 1, Duration::from_secs(1)).await;
+    assert!(client.is_connected());
+    assert_eq!(
+        state.last_body.lock().await.as_ref(),
+        Some(&json!({"heartbeat_id": ""})),
+    );
+
+    client.connect().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 1);
+
+    await_heartbeat_posts(&state, 2, Duration::from_secs(5)).await;
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        state.last_body.lock().await.as_ref(),
+        Some(&json!({"heartbeat_id": "heartbeat-next"})),
+    );
+
+    client.disconnect().await.unwrap();
+    assert!(!client.is_connected());
+
+    client.connect().await.unwrap();
+    await_heartbeat_posts(&state, 3, Duration::from_secs(1)).await;
+    assert!(client.is_connected());
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 3);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_resynchronizes_immediately_with_replacement_id() {
+    let state = TestServerState::default();
+    state
+        .heartbeat_resynchronize_remaining
+        .store(1, Ordering::Release);
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_heartbeat_posts(&state, 2, Duration::from_secs(1)).await;
+
+    assert!(client.is_connected());
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        state.last_body.lock().await.as_ref(),
+        Some(&json!({"heartbeat_id": "heartbeat-resynchronized"})),
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_repeated_heartbeat_resynchronization_marks_execution_unhealthy() {
+    let state = TestServerState::default();
+    state
+        .heartbeat_resynchronize_remaining
+        .store(2, Ordering::Release);
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_heartbeat_posts(&state, 2, Duration::from_secs(1)).await;
+    await_execution_unhealthy(&client, Duration::from_secs(1)).await;
+
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 2);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_disconnect_cancels_and_awaits_in_flight_heartbeat() {
+    let state = TestServerState::default();
+    state.heartbeat_request_gate.enable();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.heartbeat_request_gate.started() == 1 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+    state.heartbeat_request_gate.release();
+
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_ok());
+    assert!(!client.is_connected());
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_authentication_failure_marks_execution_unhealthy() {
+    let state = TestServerState::default();
+    *state.heartbeat_response_status.lock().await = StatusCode::UNAUTHORIZED;
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_execution_unhealthy(&client, Duration::from_secs(1)).await;
+
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_venue_rejection_marks_execution_unhealthy() {
+    let state = TestServerState::default();
+    *state.heartbeat_response.lock().await = json!({"status": "rejected"});
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_execution_unhealthy(&client, Duration::from_secs(1)).await;
+
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_repeated_heartbeat_request_failure_marks_execution_unhealthy() {
+    let state = TestServerState::default();
+    *state.heartbeat_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_heartbeat_posts(&state, 2, Duration::from_secs(6)).await;
+    await_execution_unhealthy(&client, Duration::from_secs(1)).await;
+
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 2);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_heartbeat_success_resets_consecutive_request_failures() {
+    let state = TestServerState::default();
+    state.heartbeat_response_statuses.lock().await.extend([
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::OK,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ]);
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_heartbeat_posts(&state, 3, Duration::from_secs(11)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(client.is_connected());
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 3);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_repeated_heartbeat_request_timeout_marks_execution_unhealthy() {
+    let state = TestServerState::default();
+    state.heartbeat_request_gate.enable();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_heartbeat(addr, true);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_execution_unhealthy(&client, Duration::from_secs(10)).await;
+
+    let started = state.heartbeat_request_gate.started();
+    for _ in 0..started {
+        state.heartbeat_request_gate.release();
+    }
+    assert_eq!(started, 2);
+    assert_eq!(state.heartbeat_post_count.load(Ordering::Acquire), 2);
+
+    client.disconnect().await.unwrap();
+}
+
+async fn await_heartbeat_posts(state: &TestServerState, expected: usize, timeout: Duration) {
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.heartbeat_post_count.load(Ordering::Acquire) >= expected }
+        },
+        timeout,
+    )
+    .await;
+}
+
+async fn await_execution_unhealthy(client: &PolymarketExecutionClient, timeout: Duration) {
+    wait_until_async(|| async { !client.is_connected() }, timeout).await;
 }
 
 #[rstest]
@@ -2659,16 +3032,17 @@ fn add_instrument_to_cache_with_size_precision(
     instrument_id: InstrumentId,
     size_precision: u8,
 ) {
-    add_instrument_to_cache_with_precisions(cache, instrument_id, 4, size_precision);
+    add_instrument_to_cache_with_tick(cache, instrument_id, "0.0001", size_precision);
 }
 
-fn add_instrument_to_cache_with_precisions(
+fn add_instrument_to_cache_with_tick(
     cache: &Rc<RefCell<Cache>>,
     instrument_id: InstrumentId,
-    price_precision: u8,
+    tick_size: &str,
     size_precision: u8,
 ) {
     let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+    let price_increment = Price::from(tick_size);
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
     } else {
@@ -2686,12 +3060,9 @@ fn add_instrument_to_cache_with_precisions(
         Currency::pUSD(),
         UnixNanos::default(), // activation_ns
         UnixNanos::default(), // expiration_ns
-        price_precision,
+        price_increment.precision,
         size_precision,
-        Price::from(format!(
-            "0.{}1",
-            "0".repeat((price_precision as usize).saturating_sub(1))
-        )),
+        price_increment,
         size_increment,
         None, // outcome
         None, // description
@@ -2896,6 +3267,48 @@ async fn test_submit_order_denied_for_price_out_of_range(#[case] price: &str) {
 }
 
 #[rstest]
+#[case("0.005", "0.501")]
+#[case("0.0025", "0.501")]
+#[tokio::test]
+async fn test_submit_order_denied_for_price_misaligned(
+    #[case] tick_size: &str,
+    #[case] price: &str,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_tick(&cache, instrument_id, tick_size, 2);
+    let order = make_limit_order_at_price(
+        "O-PRICE-MISALIGNED",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from(price),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
+    assert_eq!(
+        order_event_reason(&denied),
+        format!("Limit order price {price} does not conform to Polymarket tick size {tick_size}")
+    );
+    assert_eq!(*state.order_post_count.lock().await, 0);
+}
+
+#[rstest]
 #[case("0.0001")]
 #[case("0.9999")]
 #[tokio::test]
@@ -2945,7 +3358,7 @@ async fn test_submit_immediate_limit_buy_denies_fractional_cent_maker_amount(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_precisions(&cache, instrument_id, 3, 2);
+    add_instrument_to_cache_with_tick(&cache, instrument_id, "0.001", 2);
     let order = make_limit_order_at_price_and_quantity(
         "O-IOC-FRACTIONAL-CENT",
         instrument_id,
@@ -2990,7 +3403,7 @@ async fn test_submit_immediate_limit_sell_preserves_fractional_cent_taker_amount
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_precisions(&cache, instrument_id, 3, 2);
+    add_instrument_to_cache_with_tick(&cache, instrument_id, "0.001", 2);
     let order = make_limit_order_at_price_and_quantity(
         "O-SELL-FRACTIONAL-CENT",
         instrument_id,
@@ -3036,13 +3449,15 @@ async fn test_submit_immediate_limit_sell_preserves_fractional_cent_taker_amount
 }
 
 #[rstest]
-#[case::tick_tenth(1, "0.5", "10", "5000000", "10000000")]
-#[case::tick_hundredth(2, "0.56", "10", "5600000", "10000000")]
-#[case::tick_thousandth(3, "0.961", "10", "9610000", "10000000")]
-#[case::tick_ten_thousandth(4, "0.9612", "25", "24030000", "25000000")]
+#[case::tick_tenth("0.1", "0.5", "10", "5000000", "10000000")]
+#[case::tick_hundredth("0.01", "0.56", "10", "5600000", "10000000")]
+#[case::tick_half_cent("0.005", "0.505", "10", "5050000", "10000000")]
+#[case::tick_quarter_cent("0.0025", "0.5025", "20", "10050000", "20000000")]
+#[case::tick_thousandth("0.001", "0.961", "10", "9610000", "10000000")]
+#[case::tick_ten_thousandth("0.0001", "0.9612", "25", "24030000", "25000000")]
 #[tokio::test]
 async fn test_submit_limit_order_serializes_amount_matrix(
-    #[case] price_precision: u8,
+    #[case] tick_size: &str,
     #[case] price: &str,
     #[case] quantity: &str,
     #[case] notional_amount: &str,
@@ -3062,7 +3477,7 @@ async fn test_submit_limit_order_serializes_amount_matrix(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_precisions(&cache, instrument_id, price_precision, 2);
+    add_instrument_to_cache_with_tick(&cache, instrument_id, tick_size, 2);
     let order = make_limit_order_at_price_and_quantity(
         "O-AMOUNT-MATRIX",
         instrument_id,
@@ -3492,13 +3907,15 @@ async fn test_submit_order_5xx_exhausts_retries_submit_outcome_unknown() {
 }
 
 #[rstest]
-#[case::tick_tenth(1, "0.5", "10", "5000000", "10000000")]
-#[case::tick_hundredth(2, "0.56", "10", "5600000", "10000000")]
-#[case::tick_thousandth(3, "0.961", "10", "9610000", "10000000")]
-#[case::tick_ten_thousandth(4, "0.9612", "25", "24030000", "25000000")]
+#[case::tick_tenth("0.1", "0.5", "10", "5000000", "10000000")]
+#[case::tick_hundredth("0.01", "0.56", "10", "5600000", "10000000")]
+#[case::tick_half_cent("0.005", "0.505", "10", "5050000", "10000000")]
+#[case::tick_quarter_cent("0.0025", "0.5025", "20", "10050000", "20000000")]
+#[case::tick_thousandth("0.001", "0.961", "10", "9610000", "10000000")]
+#[case::tick_ten_thousandth("0.0001", "0.9612", "25", "24030000", "25000000")]
 #[tokio::test]
 async fn test_submit_order_list_serializes_amount_matrix(
-    #[case] price_precision: u8,
+    #[case] tick_size: &str,
     #[case] price: &str,
     #[case] quantity: &str,
     #[case] notional_amount: &str,
@@ -3521,7 +3938,7 @@ async fn test_submit_order_list_serializes_amount_matrix(
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_precisions(&cache, instrument_id, price_precision, 2);
+    add_instrument_to_cache_with_tick(&cache, instrument_id, tick_size, 2);
     let buy = make_limit_order_at_price_and_quantity(
         "O-LIST-AMOUNT-BUY",
         instrument_id,
@@ -3598,7 +4015,7 @@ async fn test_submit_order_list_denies_unrepresentable_immediate_buys_before_pos
     client.start().unwrap();
 
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_precisions(&cache, instrument_id, 3, 2);
+    add_instrument_to_cache_with_tick(&cache, instrument_id, "0.001", 2);
     let orders = [
         make_limit_order_at_price_and_quantity(
             "O-LIST-FAK-FRACTIONAL-CENT",
@@ -4850,6 +5267,217 @@ async fn test_batch_cancel_orders_with_partial_failure() {
     // No CancelRejected events expected.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[case::batch(
+    ShutdownCancelMode::Batch,
+    1_121,
+    TEST_CHUNK_PRIVATE_KEY,
+    CancelChunkRetry::Succeeds
+)]
+#[case::cancel_all(
+    ShutdownCancelMode::CancelAll,
+    121,
+    TEST_CANCEL_ALL_PRIVATE_KEY,
+    CancelChunkRetry::None
+)]
+#[case::late_failure(
+    ShutdownCancelMode::Batch,
+    121,
+    TEST_CHUNK_FAILURE_PRIVATE_KEY,
+    CancelChunkRetry::Exhausts
+)]
+#[case::tier_downgrade(
+    ShutdownCancelMode::Batch,
+    241,
+    TEST_CHUNK_DOWNGRADE_PRIVATE_KEY,
+    CancelChunkRetry::Downgrades
+)]
+#[tokio::test]
+async fn test_group_cancel_orders_bounds_retries_and_result_processing(
+    #[case] mode: ShutdownCancelMode,
+    #[case] order_count: usize,
+    #[case] private_key: &str,
+    #[case] chunk_retry: CancelChunkRetry,
+) {
+    let state = TestServerState::default();
+    state
+        .batch_cancel_echo_rejections
+        .store(true, Ordering::Release);
+
+    match chunk_retry {
+        CancelChunkRetry::None => {}
+        CancelChunkRetry::Succeeds => {
+            state.batch_cancel_response_statuses.lock().await.extend([
+                StatusCode::OK,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::OK,
+                StatusCode::OK,
+            ]);
+            let mut headers = HeaderMap::new();
+            headers.insert("poly-ratelimit-tier", "Gold".parse().unwrap());
+            state
+                .batch_cancel_response_headers
+                .lock()
+                .await
+                .push_back(headers);
+        }
+        CancelChunkRetry::Exhausts => {
+            state.batch_cancel_response_statuses.lock().await.extend([
+                StatusCode::OK,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ]);
+        }
+        CancelChunkRetry::Downgrades => {
+            state.batch_cancel_response_statuses.lock().await.extend([
+                StatusCode::OK,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::OK,
+                StatusCode::OK,
+            ]);
+            let mut headers = state.batch_cancel_response_headers.lock().await;
+
+            for tier in ["Gold", "Standard"] {
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert("poly-ratelimit-tier", tier.parse().unwrap());
+                headers.push_back(response_headers);
+            }
+        }
+    }
+    let addr = start_mock_server(state.clone()).await;
+    let max_retries = u32::from(!matches!(chunk_retry, CancelChunkRetry::None));
+    let mut config = create_test_exec_config_with_retries(addr, max_retries);
+    config.private_key = Some(private_key.to_string());
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut cancels = Vec::with_capacity(order_count);
+    let mut expected_client_order_ids = HashSet::with_capacity(order_count);
+    let mut venue_order_ids = Vec::with_capacity(order_count);
+    for index in 0..order_count {
+        let client_order_id = format!("O-CHUNK-{index}");
+        let venue_order_id = format!("0x{index:064x}");
+        let mut order = make_limit_order(
+            &client_order_id,
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        );
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        submit_and_accept_order(&cache, &mut order, &venue_order_id);
+        cancels.push(make_cancel_cmd(&client_order_id, instrument_id));
+        expected_client_order_ids.insert(client_order_id);
+        venue_order_ids.push(venue_order_id);
+    }
+
+    match mode {
+        ShutdownCancelMode::Batch => client
+            .batch_cancel_orders(BatchCancelOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*POLYMARKET_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                cancels,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap(),
+        ShutdownCancelMode::CancelAll => client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*POLYMARKET_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                OrderSide::Buy,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap(),
+        ShutdownCancelMode::Individual => unreachable!(),
+    }
+
+    let mut processed_client_order_ids = HashSet::with_capacity(order_count);
+
+    if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
+        wait_until_async(
+            || {
+                let state = state.clone();
+                async move { *state.batch_cancel_delete_count.lock().await == 3 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    } else {
+        for _ in 0..order_count {
+            let event = assert_order_event(recv_execution_event(&mut rx).await, "CancelRejected");
+            let OrderEventAny::CancelRejected(event) = event else {
+                unreachable!();
+            };
+            assert!(processed_client_order_ids.insert(event.client_order_id.to_string()));
+        }
+    }
+    assert_no_execution_event(&mut rx).await;
+
+    let bodies = state.batch_cancel_bodies.lock().await;
+    let body_lengths = bodies
+        .iter()
+        .map(|body| body.as_array().unwrap().len())
+        .collect::<Vec<_>>();
+
+    match chunk_retry {
+        CancelChunkRetry::None => assert_eq!(body_lengths, vec![120, 1]),
+        CancelChunkRetry::Succeeds => {
+            assert_eq!(body_lengths, vec![120, 1_000, 1_000, 1]);
+            assert_eq!(bodies[1], bodies[2]);
+        }
+        CancelChunkRetry::Exhausts => {
+            assert_eq!(body_lengths, vec![120, 1, 1]);
+            assert_eq!(bodies[1], bodies[2]);
+        }
+        CancelChunkRetry::Downgrades => {
+            assert_eq!(body_lengths, vec![120, 121, 120, 1]);
+        }
+    }
+    let successful_body_indices: &[usize] = match chunk_retry {
+        CancelChunkRetry::None => &[0, 1],
+        CancelChunkRetry::Succeeds => &[0, 2, 3],
+        CancelChunkRetry::Exhausts => &[0],
+        CancelChunkRetry::Downgrades => &[0, 2, 3],
+    };
+    let successful_order_ids = bodies
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| successful_body_indices.contains(index))
+        .flat_map(|(_, body)| body.as_array().unwrap())
+        .map(|order_id| order_id.as_str().unwrap().to_string())
+        .collect::<HashSet<_>>();
+    let expected_successful_order_ids = if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
+        venue_order_ids[..120].iter().cloned().collect()
+    } else {
+        venue_order_ids.iter().cloned().collect()
+    };
+
+    assert_eq!(successful_order_ids, expected_successful_order_ids);
+
+    if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
+        assert!(processed_client_order_ids.is_empty());
+    } else {
+        assert_eq!(processed_client_order_ids, expected_client_order_ids);
+    }
+    assert_eq!(*state.batch_cancel_delete_count.lock().await, bodies.len());
 }
 
 #[rstest]

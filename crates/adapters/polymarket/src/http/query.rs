@@ -62,7 +62,7 @@ pub struct GetTradesParams {
     pub next_cursor: Option<String>,
 }
 
-/// Query parameters for `GET /balance-allowance`.
+/// Query parameters for `GET /balance-allowance` and `GET /balance-allowance/update`.
 #[derive(Clone, Debug, Default, Serialize, Builder)]
 #[builder(setter(into, strip_option), default)]
 pub struct GetBalanceAllowanceParams {
@@ -116,12 +116,19 @@ pub struct OrderResponse {
 ///
 /// All endpoints return the same format:
 /// `{ "canceled": ["0x..."], "not_canceled": {"0x...": "reason"} }`
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct CancelResponse {
     #[serde(default)]
     pub canceled: Vec<String>,
     #[serde(default)]
     pub not_canceled: AHashMap<String, Option<String>>,
+}
+
+impl CancelResponse {
+    pub(crate) fn merge(&mut self, mut response: Self) {
+        self.canceled.append(&mut response.canceled);
+        self.not_canceled.extend(response.not_canceled);
+    }
 }
 
 /// Type alias for backwards compatibility.
@@ -617,6 +624,21 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_response_ignores_async_execution_fields() {
+        // After the CLOB async execution rollout, matched POST /order responses
+        // carry `tradeIDs` (and may surface `transactionsHashes`); OrderResponse
+        // models neither, so serde must ignore them rather than reject the body.
+        let resp: OrderResponse = load("http_order_response_async_exec.json");
+
+        assert!(resp.success);
+        assert_eq!(
+            resp.order_id.as_deref(),
+            Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12")
+        );
+        assert!(resp.error_msg.is_none());
+    }
+
+    #[rstest]
     fn test_cancel_response_ok() {
         let resp: CancelResponse = load("http_cancel_response_ok.json");
 
@@ -644,6 +666,36 @@ mod tests {
         assert_eq!(resp.not_canceled.len(), 1);
         let reason = resp.not_canceled.values().next().and_then(|v| v.as_deref());
         assert_eq!(reason, Some("already canceled or matched"));
+    }
+
+    #[rstest]
+    fn test_cancel_response_merge_preserves_canceled_and_not_canceled_results() {
+        let mut merged = CancelResponse {
+            canceled: vec!["order-1".to_string()],
+            not_canceled: AHashMap::from_iter([(
+                "order-2".to_string(),
+                Some("already canceled".to_string()),
+            )]),
+        };
+        merged.merge(CancelResponse {
+            canceled: vec!["order-3".to_string()],
+            not_canceled: AHashMap::from_iter([(
+                "order-4".to_string(),
+                Some("order not found".to_string()),
+            )]),
+        });
+
+        assert_eq!(
+            merged.canceled,
+            vec!["order-1".to_string(), "order-3".to_string()]
+        );
+        assert_eq!(
+            merged.not_canceled,
+            AHashMap::from_iter([
+                ("order-2".to_string(), Some("already canceled".to_string())),
+                ("order-4".to_string(), Some("order not found".to_string())),
+            ])
+        );
     }
 
     #[rstest]

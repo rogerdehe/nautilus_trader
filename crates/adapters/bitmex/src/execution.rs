@@ -18,7 +18,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -89,7 +89,7 @@ pub struct BitmexExecutionClient {
     _submitter: SubmitBroadcaster,
     _canceller: CancelBroadcaster,
     ws_stream_handle: Option<JoinHandle<()>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
     dms_task_handle: Option<JoinHandle<()>>,
     dms_running: Arc<AtomicBool>,
 }
@@ -152,6 +152,7 @@ impl BitmexExecutionClient {
             config.api_secret.clone(),
             Some(account_id),
             config.heartbeat_interval_secs,
+            config.auth_timeout_secs,
             config.environment,
             config.transport_backend,
             config.proxy_url.clone(),
@@ -221,7 +222,7 @@ impl BitmexExecutionClient {
             _submitter,
             _canceller,
             ws_stream_handle: None,
-            pending_tasks: Mutex::new(Vec::new()),
+            pending_tasks: TaskHandles::default(),
             dms_task_handle: None,
             dms_running: Arc::new(AtomicBool::new(false)),
         })
@@ -237,25 +238,11 @@ impl BitmexExecutionClient {
             }
         });
 
-        let mut guard = self
-            .pending_tasks
-            .lock()
-            .expect("pending task lock poisoned");
-
-        // Remove completed tasks to prevent unbounded growth
-        guard.retain(|h| !h.is_finished());
-        guard.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut guard = self
-            .pending_tasks
-            .lock()
-            .expect("pending task lock poisoned");
-
-        for handle in guard.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     /// Populates `order_identities` for an order if not already present.

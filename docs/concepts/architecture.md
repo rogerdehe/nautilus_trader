@@ -239,7 +239,7 @@ Here are the available environments you can work with:
 
 ### Common core
 
-The platform has been designed to share as much common code between backtest, sandbox and live trading systems as possible.
+The platform has been designed to share as much common code between backtest, sandbox, and live trading systems as possible.
 This is formalized in the `system` subpackage, where you will find the `NautilusKernel` class,
 providing a common core system 'kernel'.
 
@@ -526,7 +526,7 @@ from the left nav menu.
 
 ### Core / low-level
 
-- `core`: Constants, functions and low-level components used throughout the framework.
+- `core`: Constants, functions, and low-level components used throughout the framework.
 - `common`: Common parts for assembling the frameworks various components.
 - `network`: Low-level base components for networking clients.
 - `serialization`: Serialization base components and serializer implementations.
@@ -541,7 +541,7 @@ from the left nav menu.
 - `data`: The data stack and data tooling for the platform.
 - `execution`: The execution stack for the platform.
 - `indicators`: A set of efficient indicators and analyzers.
-- `persistence`: Data storage, cataloging and retrieval, mainly to support backtesting.
+- `persistence`: Data storage, cataloging, and retrieval, mainly to support backtesting.
 - `portfolio`: Portfolio management functionality.
 - `risk`: Risk specific components and tooling.
 - `trading`: Trading domain specific components and tooling.
@@ -638,7 +638,7 @@ flowchart BT
 **Crate categories:**
 
 | Category       | Crates                                                    | Purpose                                                  |
-|----------------|-----------------------------------------------------------|----------------------------------------------------------|
+| -------------- | --------------------------------------------------------- | -------------------------------------------------------- |
 | Foundation     | `core`, `model`, `common`, `system`, `trading`            | Primitives, domain model, kernel, actor & strategy base. |
 | Engines        | `data`, `execution`, `portfolio`, `risk`                  | Core trading engine components.                          |
 | Infrastructure | `serialization`, `network`, `cryptography`, `persistence` | Encoding, networking, signing, storage.                  |
@@ -648,12 +648,12 @@ flowchart BT
 
 **Feature flags:**
 
-| Feature     | Crates                     | Effect                                                     |
-|-------------|----------------------------|------------------------------------------------------------|
-| `streaming` | `data`, `system`, `live`   | Enables `persistence` dependency for catalog streaming.    |
-| `cloud`     | `persistence`              | Enables cloud storage backends (S3, Azure, GCP, HTTP).     |
-| `python`    | most crates                | Enables PyO3 bindings (auto‑enables `streaming`, `cloud`). |
-| `defi`      | `common`, `model`, `data`  | Enables DeFi/blockchain data types.                        |
+| Feature     | Crates                    | Effect                                                     |
+| ----------- | ------------------------- | ---------------------------------------------------------- |
+| `streaming` | `data`, `system`, `live`  | Enables `persistence` dependency for catalog streaming.    |
+| `cloud`     | `persistence`             | Enables cloud storage backends (S3, Azure, GCP, HTTP).     |
+| `python`    | most crates               | Enables PyO3 bindings (auto‑enables `streaming`, `cloud`). |
+| `defi`      | `common`, `model`, `data` | Enables DeFi/blockchain data types.                        |
 
 :::note
 Both Rust and Cython are build dependencies. The binary wheels produced from a build do not require

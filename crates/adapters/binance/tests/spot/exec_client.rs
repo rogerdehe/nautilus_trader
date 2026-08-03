@@ -102,6 +102,13 @@ const ORDERS_GROUP_BLOCK_LENGTH: u16 = 162;
 const PRICE_FILTER_TEMPLATE_ID: u16 = 1;
 const LOT_SIZE_FILTER_TEMPLATE_ID: u16 = 4;
 
+/// WS trading setup timeout for the tests that exercise setup expiry.
+///
+/// Sized to expire quickly while leaving room for the request to reach the
+/// loopback server and be recorded: the timer starts when the command is
+/// queued on the handler channel, not when the frame hits the socket.
+const TEST_WS_SETUP_TIMEOUT_MS: u64 = 250;
+
 fn create_sbe_header(block_length: u16, template_id: u16) -> [u8; 8] {
     let mut header = [0u8; 8];
     header[0..2].copy_from_slice(&block_length.to_le_bytes());
@@ -541,6 +548,7 @@ enum WsSetupBehavior {
     RejectSessionLogon,
     IgnoreSessionLogon,
     RejectUserDataSubscribe,
+    IgnoreUserDataSubscribe,
 }
 
 #[derive(Clone)]
@@ -564,16 +572,16 @@ impl WsSetupState {
     }
 }
 
-fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Router {
-    create_exec_test_router_with_fill_fixture(order_query_count, FillFixtureMode::Stable, None)
+fn create_exec_test_router(order_query_received: Option<Arc<tokio::sync::Notify>>) -> Router {
+    create_exec_test_router_with_fill_fixture(order_query_received, FillFixtureMode::Stable, None)
 }
 
 fn create_exec_test_router_with_fill_fixture(
-    order_query_count: Option<Arc<AtomicUsize>>,
+    order_query_received: Option<Arc<tokio::sync::Notify>>,
     mode: FillFixtureMode,
     captured_queries: Option<CapturedQueries>,
 ) -> Router {
-    let order_query_count_for_order_route = order_query_count;
+    let order_query_received_for_order_route = order_query_received;
     let state = FillFixtureState {
         mode,
         captured_queries,
@@ -695,14 +703,14 @@ fn create_exec_test_router_with_fill_fixture(
                 },
             )
             .get(move |headers: HeaderMap| {
-                let order_query_count = order_query_count_for_order_route.clone();
+                let order_query_received = order_query_received_for_order_route.clone();
                 async move {
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
 
-                    if let Some(count) = order_query_count {
-                        count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(received) = order_query_received {
+                        received.notify_one();
                     }
 
                     no_such_order_response().into_response()
@@ -1137,6 +1145,7 @@ async fn handle_ws_setup_socket(mut socket: WebSocket, state: WsSetupState) {
                             break;
                         }
                     }
+                    ("userDataStream.subscribe", WsSetupBehavior::IgnoreUserDataSubscribe) => {}
                     ("userDataStream.subscribe", _) => {
                         match send_ws_setup_result(
                             &mut socket,
@@ -1193,13 +1202,13 @@ async fn send_ws_setup_error(
 }
 
 async fn start_exec_test_server() -> SocketAddr {
-    start_exec_test_server_with_order_query_count(None).await
+    start_exec_test_server_with_order_query_signal(None).await
 }
 
-async fn start_exec_test_server_with_order_query_count(
-    order_query_count: Option<Arc<AtomicUsize>>,
+async fn start_exec_test_server_with_order_query_signal(
+    order_query_received: Option<Arc<tokio::sync::Notify>>,
 ) -> SocketAddr {
-    let router = create_exec_test_router(order_query_count);
+    let router = create_exec_test_router(order_query_received);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1240,19 +1249,6 @@ async fn start_exec_test_server_with_fill_fixture(
             .await
             .unwrap();
     });
-
-    let health_url = format!("http://{addr}/api/v3/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
-    wait_until_async(
-        || {
-            let url = health_url.clone();
-            let client = http_client.clone();
-            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
 
     (addr, captured_queries)
 }
@@ -1328,6 +1324,24 @@ fn create_test_execution_client_with_ws_trading(
     create_test_execution_client_with_transport(base_url_http, true, Some(base_url_ws_trading))
 }
 
+fn create_test_execution_client_with_ws_trading_timeout(
+    base_url_http: String,
+    base_url_ws_trading: String,
+    ws_trading_setup_timeout_ms: u64,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+        base_url_http,
+        true,
+        Some(base_url_ws_trading),
+        true,
+        ws_trading_setup_timeout_ms,
+    )
+}
+
 fn create_test_execution_client_with_transport(
     base_url_http: String,
     use_ws_trading: bool,
@@ -1350,6 +1364,26 @@ fn create_test_execution_client_with_transport_and_gtd(
     use_ws_trading: bool,
     base_url_ws_trading: Option<String>,
     use_gtd: bool,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+        base_url_http,
+        use_ws_trading,
+        base_url_ws_trading,
+        use_gtd,
+        BinanceExecClientConfig::default().ws_trading_setup_timeout_ms,
+    )
+}
+
+fn create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+    base_url_http: String,
+    use_ws_trading: bool,
+    base_url_ws_trading: Option<String>,
+    use_gtd: bool,
+    ws_trading_setup_timeout_ms: u64,
 ) -> (
     BinanceSpotExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -1378,6 +1412,7 @@ fn create_test_execution_client_with_transport_and_gtd(
         base_url_http: Some(base_url_http),
         base_url_ws_trading,
         use_ws_trading,
+        ws_trading_setup_timeout_ms,
         use_gtd,
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
@@ -1552,6 +1587,24 @@ async fn test_generate_mass_status_propagates_invalid_fill_response() {
     let error = client.generate_mass_status(Some(60)).await.unwrap_err();
 
     assert!(error.to_string().contains("SBE decode error"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_overflowing_lookback() {
+    let addr = start_exec_test_server().await;
+    let base_url = format!("http://{addr}");
+    let (client, _rx, _cache) = create_test_execution_client(base_url);
+
+    let error = client
+        .generate_mass_status(Some(307_445_735))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "lookback minutes exceed the nanosecond range"
+    );
 }
 
 #[rstest]
@@ -1852,15 +1905,23 @@ async fn test_ws_trading_reconnect_retries_ws_after_setup_failure() {
 #[rstest]
 #[tokio::test]
 async fn test_ws_trading_session_logon_rejection_uses_http_only_mode() {
-    assert_ws_setup_failure_uses_http(WsSetupBehavior::RejectSessionLogon, &["session.logon"])
-        .await;
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::RejectSessionLogon,
+        &["session.logon"],
+        None,
+    )
+    .await;
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_ws_trading_auth_timeout_uses_http_only_mode() {
-    assert_ws_setup_failure_uses_http(WsSetupBehavior::IgnoreSessionLogon, &["session.logon"])
-        .await;
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::IgnoreSessionLogon,
+        &["session.logon"],
+        Some(TEST_WS_SETUP_TIMEOUT_MS),
+    )
+    .await;
 }
 
 #[rstest]
@@ -1869,6 +1930,18 @@ async fn test_ws_trading_user_data_subscribe_rejection_uses_http_only_mode() {
     assert_ws_setup_failure_uses_http(
         WsSetupBehavior::RejectUserDataSubscribe,
         &["session.logon", "userDataStream.subscribe"],
+        None,
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_user_data_subscribe_timeout_uses_http_only_mode() {
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::IgnoreUserDataSubscribe,
+        &["session.logon", "userDataStream.subscribe"],
+        Some(TEST_WS_SETUP_TIMEOUT_MS),
     )
     .await;
 }
@@ -2855,8 +2928,9 @@ async fn test_query_account_does_not_block_within_runtime() {
 #[rstest]
 #[tokio::test]
 async fn test_query_order_missing_order_emits_no_order_report() {
-    let order_query_count = Arc::new(AtomicUsize::new(0));
-    let addr = start_exec_test_server_with_order_query_count(Some(order_query_count.clone())).await;
+    let order_query_received = Arc::new(tokio::sync::Notify::new());
+    let addr =
+        start_exec_test_server_with_order_query_signal(Some(order_query_received.clone())).await;
     let base_url = format!("http://{addr}");
 
     let (mut client, mut rx, cache) = create_test_execution_client(base_url);
@@ -2882,26 +2956,14 @@ async fn test_query_order_missing_order_emits_no_order_report() {
 
     client.query_order(query_cmd).unwrap();
 
-    wait_until_async(
-        || {
-            let order_query_count = order_query_count.clone();
-            async move { order_query_count.load(Ordering::SeqCst) > 0 }
-        },
-        Duration::from_secs(5),
-    )
+    tokio::time::timeout(Duration::from_secs(10), order_query_received.notified())
+        .await
+        .expect("Timed out waiting for authenticated order query");
+
+    assert_no_event_matching(&mut rx, |event| {
+        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_)))
+    })
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut emitted_order_report = false;
-
-    while let Ok(event) = rx.try_recv() {
-        if matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))) {
-            emitted_order_report = true;
-        }
-    }
-
-    assert!(!emitted_order_report);
 }
 
 async fn connected_client_with_command_responses(
@@ -3234,15 +3296,25 @@ async fn wait_for_ws_method(state: &WsSetupState, expected_method: &str) {
     .await;
 }
 
-async fn assert_ws_setup_failure_uses_http(behavior: WsSetupBehavior, expected_methods: &[&str]) {
+async fn assert_ws_setup_failure_uses_http(
+    behavior: WsSetupBehavior,
+    expected_methods: &[&str],
+    ws_trading_setup_timeout_ms: Option<u64>,
+) {
     let (http_addr, request_count) =
         start_exec_test_server_with_command_responses(CommandResponses::default()).await;
     let (ws_addr, ws_state) = start_ws_setup_test_server(behavior).await;
     let base_url_http = format!("http://{http_addr}");
     let base_url_ws_trading = format!("ws://{ws_addr}/ws-api/v3");
 
-    let (mut client, mut rx, cache) =
-        create_test_execution_client_with_ws_trading(base_url_http, base_url_ws_trading);
+    let (mut client, mut rx, cache) = match ws_trading_setup_timeout_ms {
+        Some(timeout_ms) => create_test_execution_client_with_ws_trading_timeout(
+            base_url_http,
+            base_url_ws_trading,
+            timeout_ms,
+        ),
+        None => create_test_execution_client_with_ws_trading(base_url_http, base_url_ws_trading),
+    };
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
 
     client.start().unwrap();
@@ -3250,7 +3322,9 @@ async fn assert_ws_setup_failure_uses_http(behavior: WsSetupBehavior, expected_m
         WsSetupBehavior::CompleteSetup | WsSetupBehavior::RejectFirstSessionLogon => {
             unreachable!("complete setup is not a setup failure")
         }
-        WsSetupBehavior::IgnoreSessionLogon => Duration::from_secs(12),
+        WsSetupBehavior::IgnoreSessionLogon | WsSetupBehavior::IgnoreUserDataSubscribe => {
+            Duration::from_secs(2)
+        }
         WsSetupBehavior::RejectSessionLogon | WsSetupBehavior::RejectUserDataSubscribe => {
             Duration::from_secs(5)
         }
@@ -3300,12 +3374,26 @@ async fn assert_no_order_event_matching<F>(
 ) where
     F: Fn(&OrderEventAny) -> bool,
 {
+    assert_no_event_matching(rx, |event| {
+        if let ExecutionEvent::Order(order_event) = event {
+            predicate(order_event)
+        } else {
+            false
+        }
+    })
+    .await;
+}
+
+async fn assert_no_event_matching<F>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    predicate: F,
+) where
+    F: Fn(&ExecutionEvent) -> bool,
+{
     let unexpected = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             let event = rx.recv().await.expect("Execution event channel closed");
-            if let ExecutionEvent::Order(order_event) = &event
-                && predicate(order_event)
-            {
+            if predicate(&event) {
                 return event;
             }
         }
@@ -3313,7 +3401,7 @@ async fn assert_no_order_event_matching<F>(
     .await;
 
     if let Ok(event) = unexpected {
-        panic!("Unexpected order event: {event:?}");
+        panic!("Unexpected execution event: {event:?}");
     }
 }
 

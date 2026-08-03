@@ -14,7 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -32,18 +35,73 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::Order,
 };
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
     execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
         messages::PolymarketWsMessage,
     },
 };
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const HEARTBEAT_TRANSPORT_FAILURE_LIMIT: u32 = 2;
+
 impl PolymarketExecutionClient {
+    fn start_heartbeat_task(&mut self) {
+        if !self.config.heartbeat_enabled {
+            return;
+        }
+
+        if self
+            .heartbeat_task
+            .as_ref()
+            .is_some_and(|task| !task.handle.is_finished())
+        {
+            return;
+        }
+
+        if let Some(completed) = self.heartbeat_task.take() {
+            completed.handle.abort();
+        }
+
+        self.heartbeat_healthy.store(true, Ordering::Release);
+        let cancellation = CancellationToken::new();
+
+        let handle = get_runtime().spawn(run_heartbeats(
+            self.http_client.clone(),
+            cancellation.clone(),
+            Arc::clone(&self.heartbeat_healthy),
+        ));
+        self.heartbeat_task = Some(super::HeartbeatTask {
+            cancellation,
+            handle,
+        });
+    }
+
+    fn abort_heartbeat_task(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.cancellation.cancel();
+            task.handle.abort();
+        }
+    }
+
+    async fn stop_heartbeat_task(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.cancellation.cancel();
+            if let Err(e) = task.handle.await
+                && !e.is_cancelled()
+            {
+                log::warn!("Heartbeat task failed to join during disconnect: {e}");
+            }
+        }
+    }
+
     fn ensure_order_event_subscription(&mut self) {
         if self.order_event_handler.is_some() {
             return;
@@ -125,26 +183,16 @@ impl PolymarketExecutionClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     pub(super) fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     pub(super) async fn await_pending_tasks(&self) {
         loop {
-            let tasks: Vec<_> = self
-                .pending_tasks
-                .lock()
-                .expect(MUTEX_POISONED)
-                .drain(..)
-                .collect();
+            let tasks = self.pending_tasks.take_all();
 
             if tasks.is_empty() {
                 break;
@@ -305,7 +353,7 @@ impl PolymarketExecutionClient {
             log::debug!("User WebSocket handler task completed");
         });
 
-        *self.ws_stream_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+        self.ws_stream_handle = Some(handle);
         Ok(())
     }
 
@@ -438,10 +486,11 @@ impl PolymarketExecutionClient {
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
 
+        self.abort_heartbeat_task();
         self.ws_client.abort();
 
         self.core.set_disconnected();
@@ -494,6 +543,7 @@ impl PolymarketExecutionClient {
         }
 
         self.core.set_connected();
+        self.start_heartbeat_task();
 
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
@@ -508,12 +558,13 @@ impl PolymarketExecutionClient {
 
         self.stopping.store(true, Ordering::Release);
         self.await_pending_tasks().await;
+        self.stop_heartbeat_task().await;
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
 
         self.ws_client.disconnect().await?;
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
 
@@ -525,6 +576,80 @@ impl PolymarketExecutionClient {
 
     pub(super) fn on_instrument_update(&self, instrument: &InstrumentAny) {
         self.upsert_execution_lookup(instrument);
+    }
+}
+
+async fn run_heartbeats(
+    http_client: crate::http::clob::PolymarketClobHttpClient,
+    cancellation: CancellationToken,
+    healthy: Arc<AtomicBool>,
+) {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_id = String::new();
+    let mut transport_failures = 0;
+
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+
+        let mut resynchronized = false;
+
+        loop {
+            let response = tokio::select! {
+                () = cancellation.cancelled() => return,
+                response = tokio::time::timeout(
+                    HEARTBEAT_REQUEST_TIMEOUT,
+                    http_client.post_heartbeat(&heartbeat_id),
+                ) => response.unwrap_or(Err(HttpError::Timeout)),
+            };
+
+            match response {
+                Ok(HeartbeatResponse::Acknowledged(next_id)) => {
+                    if let Some(next_id) = next_id {
+                        heartbeat_id = next_id;
+                    }
+                    transport_failures = 0;
+                    break;
+                }
+                Ok(HeartbeatResponse::Resynchronize(next_id)) if !resynchronized => {
+                    heartbeat_id = next_id;
+                    resynchronized = true;
+                }
+                Ok(HeartbeatResponse::Resynchronize(_)) => {
+                    log::error!("Polymarket heartbeat rejected after ID resynchronization");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+                Err(e) if e.is_retryable() => {
+                    transport_failures += 1;
+                    if transport_failures >= HEARTBEAT_TRANSPORT_FAILURE_LIMIT {
+                        log::error!(
+                            "Polymarket heartbeat failed after {transport_failures} consecutive transport attempts"
+                        );
+                        healthy.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    log::warn!(
+                        "Polymarket heartbeat transport attempt {transport_failures} failed"
+                    );
+                    break;
+                }
+                Err(HttpError::Auth(_)) => {
+                    log::error!("Polymarket heartbeat authentication failed");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+                Err(_) => {
+                    log::error!("Polymarket heartbeat was rejected by the venue");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -623,6 +748,7 @@ fn is_terminal_order_event(event: &OrderEventAny) -> bool {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use nautilus_common::{
         cache::Cache,
         live::runner::set_exec_event_sender,
@@ -646,12 +772,31 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::factories::spawn_rejecting_proxy;
 
     const TEST_PRIVATE_KEY: &str =
         "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 
     fn test_client() -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
+        test_client_with_proxy(None)
+    }
+
+    fn test_client_with_proxy(
+        proxy_url: Option<String>,
+    ) -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
+        test_client_with_proxy_and_http_urls(
+            proxy_url,
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3000",
+        )
+    }
+
+    fn test_client_with_proxy_and_http_urls(
+        proxy_url: Option<String>,
+        base_url_http: &str,
+        base_url_data_api: &str,
+    ) -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let core = ExecutionClientCore::new(
             TraderId::from("TESTER-001"),
@@ -673,15 +818,79 @@ mod tests {
                 api_secret: Some(TEST_API_SECRET_B64.to_string()),
                 passphrase: Some("test_pass".to_string()),
                 funder: None,
-                base_url_http: Some("http://127.0.0.1:3000".to_string()),
+                base_url_http: Some(base_url_http.to_string()),
                 base_url_ws: Some("ws://127.0.0.1:3000/ws".to_string()),
-                base_url_data_api: Some("http://127.0.0.1:3000".to_string()),
+                base_url_data_api: Some(base_url_data_api.to_string()),
+                proxy_url,
                 ..crate::config::PolymarketExecClientConfig::default()
             },
         )
         .expect("test client should construct");
 
         (client, cache)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn execution_client_propagates_proxy_without_debug_exposure() {
+        const USERNAME: &str = "exec-user";
+        const SECRET: &str = "exec-client-proxy-secret";
+        let (proxy_addr, requests) = spawn_rejecting_proxy(2).await;
+        let proxy_url = format!("http://{USERNAME}:{SECRET}@{proxy_addr}");
+        let (client, _cache) = test_client_with_proxy_and_http_urls(
+            Some(proxy_url.clone()),
+            "https://clob-auth.fixture",
+            "https://data-auth.fixture",
+        );
+        let debug = format!("{client:?}");
+        let errors = [
+            client
+                .http_client
+                .get_book("auth-token")
+                .await
+                .unwrap_err()
+                .to_string(),
+            client
+                .data_api_client
+                .get_positions("0x0000000000000000000000000000000000000002")
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        let requests = requests.lock().await;
+        let request_lines = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{SECRET}")));
+
+        assert_eq!(client.config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+        assert_eq!(client.ws_client.proxy_url().unwrap().expose(), proxy_url);
+        assert_eq!(
+            request_lines,
+            [
+                "CONNECT clob-auth.fixture:443 HTTP/1.1",
+                "CONNECT data-auth.fixture:443 HTTP/1.1",
+            ]
+        );
+
+        for request in requests.iter() {
+            let auth = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("proxy-authorization")
+                        .then_some(value.trim())
+                })
+                .expect("Proxy-Authorization header");
+            assert_eq!(auth, expected_auth);
+        }
+
+        for error in errors {
+            assert!(!error.contains(SECRET));
+            assert!(!error.contains(&expected_auth));
+        }
+        assert!(!debug.contains(SECRET));
     }
 
     fn test_binary_option(raw_symbol: &str, expired: bool, neg_risk: bool) -> InstrumentAny {

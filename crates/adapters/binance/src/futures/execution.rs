@@ -31,7 +31,7 @@ use dashmap::DashMap;
 use nautilus_common::{
     cache::fifo::FifoCache,
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -42,7 +42,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     AtomicSet, MUTEX_POISONED, Params, UUID4, UnixNanos,
-    datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, mins_to_nanos},
+    datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, checked_mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
@@ -214,17 +214,17 @@ pub struct BinanceFuturesExecutionClient {
     http_client: BinanceFuturesHttpClient,
     ws_client: Arc<TokioMutex<Option<BinanceFuturesWebSocketClient>>>,
     ws_trading_client: Option<BinanceFuturesWsTradingClient>,
-    ws_trading_handle: Mutex<Option<JoinHandle<()>>>,
+    ws_trading_handle: Option<JoinHandle<()>>,
     listen_key: Arc<RwLock<Option<String>>>,
     cancellation_token: CancellationToken,
     triggered_algo_order_ids: Arc<AtomicSet<ClientOrderId>>,
     algo_client_order_ids: Arc<AtomicSet<ClientOrderId>>,
     ws_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    keepalive_task: Mutex<Option<JoinHandle<()>>>,
-    recovery_task: Mutex<Option<JoinHandle<()>>>,
+    keepalive_task: Option<JoinHandle<()>>,
+    recovery_task: Option<JoinHandle<()>>,
     recovery_lock: Arc<TokioMutex<()>>,
-    recovery_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    recovery_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    pending_tasks: TaskHandles,
     is_hedge_mode: AtomicBool,
 }
 
@@ -236,6 +236,7 @@ impl BinanceFuturesExecutionClient {
     /// Returns an error if the HTTP client fails to initialize, credentials are
     /// missing, or the product type is not a futures type (UsdM or CoinM).
     pub fn new(core: ExecutionClientCore, config: BinanceExecClientConfig) -> anyhow::Result<Self> {
+        config.validate()?;
         let product_type = config.product_type;
         match product_type {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
@@ -262,9 +263,9 @@ impl BinanceFuturesExecutionClient {
             Some(api_key.clone()),
             Some(api_secret.clone()),
             config.base_url_http.clone(),
-            None, // recv_window
+            Some(config.recv_window_ms),
             None, // timeout_secs
-            None, // proxy_url
+            config.proxy_url.clone(),
             config.treat_expired_as_canceled,
         )
         .context("failed to construct Binance Futures HTTP client")?;
@@ -282,13 +283,17 @@ impl BinanceFuturesExecutionClient {
                         _ => Some(BINANCE_FUTURES_USD_WS_API_URL.to_string()),
                     });
 
-            Some(BinanceFuturesWsTradingClient::new(
-                ws_trading_url,
-                api_key,
-                api_secret,
-                None, // heartbeat
-                config.transport_backend,
-            ))
+            Some(
+                BinanceFuturesWsTradingClient::new(
+                    ws_trading_url,
+                    api_key,
+                    api_secret,
+                    None, // heartbeat
+                    config.transport_backend,
+                )
+                .with_proxy(config.proxy_url.clone())
+                .with_recv_window(Some(config.recv_window_ms)),
+            )
         } else {
             None
         };
@@ -311,17 +316,17 @@ impl BinanceFuturesExecutionClient {
             http_client,
             ws_client: Arc::new(TokioMutex::new(None)),
             ws_trading_client,
-            ws_trading_handle: Mutex::new(None),
+            ws_trading_handle: None,
             listen_key: Arc::new(RwLock::new(None)),
             cancellation_token: CancellationToken::new(),
             triggered_algo_order_ids: Arc::new(AtomicSet::new()),
             algo_client_order_ids: Arc::new(AtomicSet::new()),
             ws_task: Arc::new(Mutex::new(None)),
-            keepalive_task: Mutex::new(None),
-            recovery_task: Mutex::new(None),
+            keepalive_task: None,
+            recovery_task: None,
             recovery_lock: Arc::new(TokioMutex::new(())),
-            recovery_tx: Mutex::new(None),
-            pending_tasks: Mutex::new(Vec::new()),
+            recovery_tx: None,
+            pending_tasks: TaskHandles::default(),
             is_hedge_mode: AtomicBool::new(false),
         })
     }
@@ -1338,7 +1343,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         } else {
             let instruments = self
                 .http_client
-                .request_instruments()
+                .request_instruments_with_config(&self.config.instrument_provider)
                 .await
                 .context("failed to request Binance Futures instruments")?;
 
@@ -1393,7 +1398,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         );
 
         let (recovery_tx, recovery_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        *self.recovery_tx.lock().expect(MUTEX_POISONED) = Some(recovery_tx.clone());
+        self.recovery_tx = Some(recovery_tx.clone());
 
         let seen_trade_ids: Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>> =
             Arc::new(Mutex::new(FifoCache::new()));
@@ -1423,6 +1428,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             api_secret: api_secret.clone(),
             private_base_url: private_base_url.clone(),
             transport_backend: self.config.transport_backend,
+            proxy_url: self.config.proxy_url.clone(),
         };
 
         let ws_client = build_and_connect_user_stream(&ws_build_params, &listen_key).await?;
@@ -1488,7 +1494,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     }
                 }
             });
-            *self.keepalive_task.lock().expect(MUTEX_POISONED) = Some(keepalive_task);
+            self.keepalive_task = Some(keepalive_task);
         }
 
         // Start listen key recovery driver task
@@ -1514,7 +1520,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 )
                 .await;
             });
-            *self.recovery_task.lock().expect(MUTEX_POISONED) = Some(recovery_task);
+            self.recovery_task = Some(recovery_task);
         }
 
         // Request initial account state
@@ -1560,7 +1566,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                         }
                     });
 
-                    *self.ws_trading_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+                    self.ws_trading_handle = Some(handle);
                 }
                 Err(e) => {
                     log::error!(
@@ -1569,6 +1575,30 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     );
                 }
             }
+        }
+
+        let refresh_secs = self.config.instrument_refresh_interval_secs;
+        if refresh_secs > 0 {
+            let http_client = self.http_client.clone();
+            let provider = self.config.instrument_provider.clone();
+            self.spawn_task("instrument_refresh", async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                interval.tick().await;
+
+                loop {
+                    interval.tick().await;
+
+                    match http_client.request_instruments_with_config(&provider).await {
+                        Ok(instruments) => log::debug!(
+                            "Refreshed Binance Futures execution instruments: count={}",
+                            instruments.len()
+                        ),
+                        Err(e) => {
+                            log::warn!("Binance Futures execution instrument refresh failed: {e}");
+                        }
+                    }
+                }
+            });
         }
 
         self.core.set_connected();
@@ -1582,13 +1612,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         }
 
         // Drop the recovery tx so the driver exits its recv loop
-        self.recovery_tx.lock().expect(MUTEX_POISONED).take();
+        self.recovery_tx.take();
 
         // Cancel all background tasks
         self.cancellation_token.cancel();
 
         // Abort WS trading task and disconnect
-        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_trading_handle.take() {
             handle.abort();
         }
 
@@ -1605,7 +1635,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         // Abort the keepalive task. An in-flight keepalive_listen_key HTTP
         // call ignores the cancellation token until it returns, so awaiting
         // without aborting can stall disconnect for the full HTTP timeout.
-        let keepalive_task = self.keepalive_task.lock().expect(MUTEX_POISONED).take();
+        let keepalive_task = self.keepalive_task.take();
         if let Some(task) = keepalive_task {
             task.abort();
             let _ = task.await;
@@ -1614,7 +1644,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         // Abort the recovery driver task. Waiting would block disconnect until
         // any in-flight HTTP or WebSocket call inside recover_user_data_stream
         // returns, which can be many seconds under a network outage.
-        let recovery_task = self.recovery_task.lock().expect(MUTEX_POISONED).take();
+        let recovery_task = self.recovery_task.take();
         if let Some(task) = recovery_task {
             task.abort();
             let _ = task.await;
@@ -2109,10 +2139,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         let ts_now = self.clock.get_time_ns();
 
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins_to_nanos(mins);
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = if let Some(mins) = lookback_mins {
+            let lookback_ns = checked_mins_to_nanos(mins)
+                .context("lookback minutes exceed the nanosecond range")?;
+            Some(UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns)))
+        } else {
+            None
+        };
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -2378,9 +2411,10 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         self.core.set_started();
 
         let http_client = self.http_client.clone();
+        let provider = self.config.instrument_provider.clone();
 
         get_runtime().spawn(async move {
-            match http_client.request_instruments().await {
+            match http_client.request_instruments_with_config(&provider).await {
                 Ok(instruments) => {
                     if instruments.is_empty() {
                         log::warn!("No instruments returned for Binance Futures");
@@ -2411,7 +2445,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         self.cancellation_token.cancel();
 
-        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_trading_handle.take() {
             handle.abort();
         }
 
@@ -2419,12 +2453,12 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             handle.abort();
         }
 
-        if let Some(handle) = self.keepalive_task.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.keepalive_task.take() {
             handle.abort();
         }
 
-        self.recovery_tx.lock().expect(MUTEX_POISONED).take();
-        if let Some(handle) = self.recovery_task.lock().expect(MUTEX_POISONED).take() {
+        self.recovery_tx.take();
+        if let Some(handle) = self.recovery_task.take() {
             handle.abort();
         }
 
@@ -3041,7 +3075,9 @@ fn is_instrument_for_product(instrument: &InstrumentAny, product_type: BinancePr
         BinanceProductType::UsdM => {
             matches!(
                 instrument,
-                InstrumentAny::CryptoFuture(_) | InstrumentAny::CryptoPerpetual(_)
+                InstrumentAny::CryptoFuture(_)
+                    | InstrumentAny::CryptoPerpetual(_)
+                    | InstrumentAny::PerpetualContract(_)
             ) && !instrument.is_inverse()
         }
         BinanceProductType::CoinM => {
@@ -3058,7 +3094,8 @@ fn is_instrument_for_product(instrument: &InstrumentAny, product_type: BinancePr
 mod tests {
     use nautilus_model::{
         instruments::stubs::{
-            crypto_future_btcusdt, crypto_perpetual_ethusdt, currency_pair_btcusdt, xbtusd_bitmex,
+            crypto_future_btcusdt, crypto_perpetual_ethusdt, currency_pair_btcusdt,
+            perpetual_contract_eurusd, xbtusd_bitmex,
         },
         types::Price,
     };
@@ -3242,6 +3279,7 @@ mod tests {
     #[rstest]
     fn test_instrument_product_matching_distinguishes_futures_products_from_spot() {
         let usdm = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let generic_perpetual = InstrumentAny::PerpetualContract(perpetual_contract_eurusd());
         let coinm = InstrumentAny::CryptoPerpetual(xbtusd_bitmex());
         let delivery =
             || crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
@@ -3253,6 +3291,14 @@ mod tests {
 
         assert!(is_instrument_for_product(&usdm, BinanceProductType::UsdM));
         assert!(!is_instrument_for_product(&usdm, BinanceProductType::CoinM));
+        assert!(is_instrument_for_product(
+            &generic_perpetual,
+            BinanceProductType::UsdM
+        ));
+        assert!(!is_instrument_for_product(
+            &generic_perpetual,
+            BinanceProductType::CoinM
+        ));
         assert!(is_instrument_for_product(&coinm, BinanceProductType::CoinM));
         assert!(!is_instrument_for_product(&coinm, BinanceProductType::UsdM));
         assert!(is_instrument_for_product(

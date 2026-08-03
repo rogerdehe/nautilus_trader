@@ -86,6 +86,7 @@ nautilus-trading = { workspace = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 bon = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -102,7 +103,10 @@ serde_json = { workspace = true }
 [dev-dependencies]
 nautilus-indicators = { workspace = true }
 nautilus-persistence = { workspace = true }
-nautilus-testkit = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "datasets",
+  "testers",
+] }
 nautilus-trading = { workspace = true, features = ["examples"] }
 
 criterion = { workspace = true }
@@ -132,9 +136,23 @@ path = "examples/node_ema_cross.rs"
 required-features = ["examples", "streaming"]
 doc = false
 
+# Run with `cargo run -p nautilus-backtest --features examples,streaming \
+#   --example backtest-node-workload -- <CATALOG_PATH> <RESULT_PATH>`
+[[example]]
+name = "backtest-node-workload"
+path = "examples/backtest_node_workload.rs"
+required-features = ["examples", "streaming"]
+doc = false
+
 # Run with `NAUTILUS_TARDIS_OPTION_CATALOG=/path/to/catalog cargo run -p nautilus-backtest --features examples,streaming --example tardis-option-chain`
 [[example]]
 name = "tardis-option-chain"
 path = "examples/tardis_option_chain.rs"
 required-features = ["examples", "streaming"]
 doc = false
+
+# Run in the normal `--tests` lane; the dev-dependency enables `nautilus-trading/examples`
+[[test]]
+name = "backtest-node-workload"
+path = "examples/backtest_node_workload.rs"
+required-features = ["streaming"]

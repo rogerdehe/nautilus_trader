@@ -348,12 +348,13 @@ fn build_price_update<T>(
 ///
 /// Lighter exposes `current_funding_rate` as the estimate for the upcoming
 /// payment. The `funding_rate` field is the last completed payment, so it is
-/// not used for the streaming Nautilus update.
+/// not used for the streaming Nautilus update. The accompanying
+/// `funding_timestamp` identifies that completed payment; market stats do not
+/// provide the next settlement time.
 ///
 /// # Errors
 ///
-/// Returns an error if the funding rate, event timestamp, or funding timestamp
-/// cannot be converted.
+/// Returns an error if the event timestamp cannot be converted.
 pub fn parse_ws_funding_rate_update(
     stats: &LighterMarketStats,
     instrument: &InstrumentAny,
@@ -361,17 +362,12 @@ pub fn parse_ws_funding_rate_update(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FundingRateUpdate> {
     let rate = stats.current_funding_rate;
-    let next_funding_ns = if stats.funding_timestamp == 0 {
-        None
-    } else {
-        Some(parse_millis_to_nanos(stats.funding_timestamp)?)
-    };
     let ts_event = parse_millis_to_nanos(timestamp_ms)?;
     Ok(FundingRateUpdate::new(
         instrument.id(),
         rate,
         None,
-        next_funding_ns,
+        None,
         ts_event,
         ts_init,
     ))
@@ -675,6 +671,10 @@ pub(crate) enum ParsedOrderEvent {
     Triggered(OrderTriggered),
     Rejected(OrderRejected),
     Updated(OrderUpdated),
+    UpdatedThenTriggered {
+        updated: OrderUpdated,
+        triggered: OrderTriggered,
+    },
 }
 
 /// Inputs that the consumption-loop dispatcher hands to
@@ -740,12 +740,14 @@ pub(crate) fn lighter_order_shape(
 ///
 /// The `Open` branch decision matrix (in order):
 ///
-/// - `trigger_status == Ready` and not yet emitted → `Triggered`.
-/// - Not yet accepted → `Accepted` (the dispatcher seeds the shape
+/// - Already accepted with a fresh `Ready` trigger and a changed shape
+///   -> `Updated`, then `Triggered`.
+/// - `trigger_status == Ready` and not yet emitted -> `Triggered`.
+/// - Not yet accepted -> `Accepted` (the dispatcher seeds the shape
 ///   snapshot so subsequent diffs are meaningful).
 /// - Already accepted and the order shape changed (qty / price / trigger)
-///   → `Updated` (the dispatcher refreshes the shape snapshot).
-/// - Already accepted with no shape change → `None` (snapshot replay).
+///   -> `Updated` (the dispatcher refreshes the shape snapshot).
+/// - Already accepted with no shape change -> `None` (snapshot replay).
 ///
 /// # Errors
 ///
@@ -772,10 +774,46 @@ pub(crate) fn parse_lighter_order_event(
     match order.status {
         LighterOrderStatus::InProgress => Ok(None),
         LighterOrderStatus::Pending | LighterOrderStatus::Open => {
-            if order.status == LighterOrderStatus::Open
+            let fresh_trigger = order.status == LighterOrderStatus::Open
                 && order.trigger_status == LighterTriggerStatus::Ready
-                && !open_ctx.triggered_already_emitted
-            {
+                && !open_ctx.triggered_already_emitted;
+
+            if fresh_trigger && open_ctx.accepted_already_emitted && open_ctx.shape_changed {
+                let shape = lighter_order_shape(order, instrument, identity.order_type)?;
+                let updated = OrderUpdated::new(
+                    trader_id,
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    cloid,
+                    shape.quantity,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                    shape.price,
+                    shape.trigger_price,
+                    None,
+                    false,
+                );
+                let triggered = OrderTriggered::new(
+                    trader_id,
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    cloid,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+                Ok(Some(ParsedOrderEvent::UpdatedThenTriggered {
+                    updated,
+                    triggered,
+                }))
+            } else if fresh_trigger {
                 let triggered = OrderTriggered::new(
                     trader_id,
                     identity.strategy_id,
@@ -1315,7 +1353,7 @@ mod tests {
             last_trade_price: Decimal::from_str("2064.50").unwrap(),
             current_funding_rate: Decimal::from_str("0.000001").unwrap(),
             funding_rate: Decimal::from_str("0.000002").unwrap(),
-            funding_timestamp: 1_774_886_400_000,
+            funding_timestamp: 1_774_879_200_000,
             daily_base_token_volume: Decimal::new(1_999_586_931, 4),
             daily_quote_token_volume: Decimal::new(471_193_598_847_246, 6),
             daily_price_low: Decimal::new(231_181, 2),
@@ -1568,24 +1606,21 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_funding_rate_update_uses_current_funding_rate() {
+    fn test_parse_ws_funding_rate_update_omits_last_payment_timestamp() {
         let instrument = create_test_instrument();
+        let stats = stub_market_stats();
+        let ts_init = UnixNanos::from(1_774_883_900_000_000_000);
 
-        let update = parse_ws_funding_rate_update(
-            &stub_market_stats(),
-            &instrument,
-            1_774_883_844_933,
-            UnixNanos::from(1),
-        )
-        .unwrap();
+        let update =
+            parse_ws_funding_rate_update(&stats, &instrument, 1_774_883_844_933, ts_init).unwrap();
 
+        assert_eq!(stats.funding_timestamp, 1_774_879_200_000);
         assert_eq!(update.instrument_id, instrument.id());
-        assert_eq!(update.rate.to_string(), "0.000001");
-        assert_eq!(
-            update.next_funding_ns,
-            Some(UnixNanos::from(1_774_886_400_000_000_000))
-        );
+        assert_eq!(update.rate, Decimal::from_str("0.000001").unwrap());
+        assert_eq!(update.interval, None);
+        assert_eq!(update.next_funding_ns, None);
         assert_eq!(update.ts_event, UnixNanos::from(1_774_883_844_933_000_000));
+        assert_eq!(update.ts_init, ts_init);
     }
 
     // Pins which field each price-update parser reads from `LighterMarketStats`.
@@ -1651,24 +1686,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.rate, sentinel);
-    }
-
-    #[rstest]
-    fn test_parse_ws_funding_rate_update_treats_zero_next_funding_as_none() {
-        let instrument = create_test_instrument();
-        let mut stats = stub_market_stats();
-        stats.funding_timestamp = 0;
-
-        let update = parse_ws_funding_rate_update(
-            &stats,
-            &instrument,
-            1_774_883_844_933,
-            UnixNanos::from(1),
-        )
-        .unwrap();
-
-        assert_eq!(update.instrument_id, instrument.id());
-        assert_eq!(update.next_funding_ns, None);
     }
 
     #[rstest]

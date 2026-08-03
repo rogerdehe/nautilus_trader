@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use nautilus_common::{
     cache::InstrumentLookupError,
     clients::DataClient,
-    live::{runner::get_data_event_sender, runtime::get_runtime},
+    live::{runner::get_data_event_sender, runtime::get_runtime, task::TaskHandles},
     messages::{
         DataEvent,
         data::{
@@ -90,9 +90,9 @@ pub struct HyperliquidDataClient {
     ws_client: HyperliquidWebSocketClient,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
-    stream_health_handle: Mutex<Option<JoinHandle<()>>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    ws_stream_handle: Option<JoinHandle<()>>,
+    stream_health_handle: Option<JoinHandle<()>>,
+    pending_tasks: TaskHandles,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     coin_to_instrument_id: Arc<AtomicMap<Ustr, InstrumentId>>,
@@ -171,9 +171,9 @@ impl HyperliquidDataClient {
             ws_client,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
-            ws_stream_handle: Mutex::new(None),
-            stream_health_handle: Mutex::new(None),
-            pending_tasks: Mutex::new(Vec::new()),
+            ws_stream_handle: None,
+            stream_health_handle: None,
+            pending_tasks: TaskHandles::default(),
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             coin_to_instrument_id: Arc::new(AtomicMap::new()),
@@ -192,37 +192,21 @@ impl HyperliquidDataClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
+        self.pending_tasks.abort_all();
+    }
+
+    fn abort_stream_health_monitor(&mut self) {
+        if let Some(handle) = self.stream_health_handle.take() {
             handle.abort();
         }
     }
 
-    fn abort_stream_health_monitor(&self) {
-        if let Some(handle) = self
-            .stream_health_handle
-            .lock()
-            .expect(MUTEX_POISONED)
-            .take()
-        {
-            handle.abort();
-        }
-    }
-
-    async fn stop_stream_health_monitor(&self) {
-        let handle = self
-            .stream_health_handle
-            .lock()
-            .expect(MUTEX_POISONED)
-            .take();
-
-        if let Some(handle) = handle {
+    async fn stop_stream_health_monitor(&mut self) {
+        if let Some(handle) = self.stream_health_handle.take() {
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -259,13 +243,16 @@ impl HyperliquidDataClient {
             && self.config.stream_health_check_interval_secs > 0
     }
 
-    fn spawn_stream_health_monitor(&self) {
+    fn spawn_stream_health_monitor(&mut self) {
         if !self.stream_health_monitor_enabled() {
             return;
         }
 
-        let mut slot = self.stream_health_handle.lock().expect(MUTEX_POISONED);
-        if slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
+        if self
+            .stream_health_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
             return;
         }
 
@@ -298,7 +285,7 @@ impl HyperliquidDataClient {
             log::debug!("Hyperliquid stream health monitor stopped");
         });
 
-        *slot = Some(handle);
+        self.stream_health_handle = Some(handle);
     }
 
     fn venue(&self) -> Venue {
@@ -500,8 +487,7 @@ impl HyperliquidDataClient {
             log::debug!("Hyperliquid WebSocket consumption loop finished");
         });
 
-        let mut slot = self.ws_stream_handle.lock().expect(MUTEX_POISONED);
-        *slot = Some(task);
+        self.ws_stream_handle = Some(task);
         log::debug!("WebSocket consumption task spawned");
 
         Ok(())
@@ -548,7 +534,7 @@ impl DataClient for HyperliquidDataClient {
         self.abort_stream_health_monitor();
         self.clear_stream_health();
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
         self.instruments.store(AHashMap::new());
@@ -618,8 +604,7 @@ impl DataClient for HyperliquidDataClient {
 
         self.cancellation_token.cancel();
 
-        let ws_stream_handle = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take();
-        if let Some(handle) = ws_stream_handle
+        if let Some(handle) = self.ws_stream_handle.take()
             && let Err(e) = handle.await
         {
             log::error!("Error waiting for WebSocket stream task: {e}");
@@ -2370,7 +2355,7 @@ mod tests {
     fn test_stream_health_receive_resets_recovery_state() {
         let mut monitor =
             MarketDataStreamHealthMonitor::new(Duration::from_secs(5), Duration::from_secs(10))
-                .with_recovery(Duration::from_secs(10), 2);
+                .with_recovery(Duration::from_secs(10), 1);
         let instrument_id = btc_perp_id();
         let start = Instant::now();
 
@@ -2403,10 +2388,6 @@ mod tests {
         );
         assert_eq!(
             check_at(&mut monitor, start, 41)[0].action,
-            StaleStreamAction::Resubscribe,
-        );
-        assert_eq!(
-            check_at(&mut monitor, start, 51)[0].action,
             StaleStreamAction::Reconnect,
         );
     }

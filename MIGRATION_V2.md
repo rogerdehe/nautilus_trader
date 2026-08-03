@@ -41,7 +41,7 @@ Core strategy, data, order, risk, portfolio, backtest, and live workflows remain
 imports and configuration to the new module paths:
 
 | v1 path                                                        | v2 path                                                   |
-|----------------------------------------------------------------|-----------------------------------------------------------|
+| -------------------------------------------------------------- | --------------------------------------------------------- |
 | `nautilus_trader.backtest.engine.BacktestEngine`               | `nautilus_trader.backtest.BacktestEngine`                 |
 | `nautilus_trader.backtest.node.BacktestNode`                   | `nautilus_trader.backtest.BacktestNode`                   |
 | `nautilus_trader.live.node.TradingNode`                        | `nautilus_trader.live.LiveNode`                           |
@@ -54,7 +54,7 @@ V2 shortens common strategy and cache names. The `QuoteTick`, `TradeTick`, and
 `register_indicator_for_*_ticks` names do not change.
 
 | v1 name                              | v2 name                        |
-|--------------------------------------|--------------------------------|
+| ------------------------------------ | ------------------------------ |
 | `on_quote_tick`                      | `on_quote`                     |
 | `on_trade_tick`                      | `on_trade`                     |
 | `on_order_book`                      | `on_book`                      |
@@ -82,6 +82,87 @@ V2 shortens common strategy and cache names. The `QuoteTick`, `TradeTick`, and
 | `cache.quote_tick_count`             | `cache.quote_count`            |
 | `cache.trade_tick_count`             | `cache.trade_count`            |
 
+### API changes
+
+V2 uses specific names for component and model identities:
+
+| v1 member          | v2 member                              |
+| ------------------ | -------------------------------------- |
+| `Actor.id`         | `DataActor.actor_id`                   |
+| `Strategy.id`      | `Strategy.strategy_id`                 |
+| `ExecAlgorithm.id` | `ExecutionAlgorithm.exec_algorithm_id` |
+| Event `id`         | `event_id`                             |
+| Report `id`        | `report_id`                            |
+| Account `type`     | `account_type`                         |
+
+Collection and lifecycle inspection also changes shape:
+
+| v1 member                      | v2 member                                                     |
+| ------------------------------ | ------------------------------------------------------------- |
+| `Order.events`                 | `Order.events()`                                              |
+| `Position.adjustments`         | `Position.adjustments()`                                      |
+| `Position.client_order_ids`    | `Position.client_order_ids()`                                 |
+| `Position.events`              | `Position.events()`                                           |
+| `Position.trade_ids`           | `Position.trade_ids()`                                        |
+| `Position.venue_order_ids`     | `Position.venue_order_ids()`                                  |
+| `OrderList.orders`             | `client_order_ids()`, then resolve each ID through the cache  |
+| `OrderList.first`              | Resolve `first_client_order_id` through the cache             |
+| `Portfolio.initialized`        | `Portfolio.is_initialized()`                                  |
+| `Portfolio.analyzer`           | `statistics()`, `snapshots()`, and `nautilus_trader.analysis` |
+| `Actor.state`/`Strategy.state` | `DataActor.state()`/`Strategy.state()`                        |
+| `ExecAlgorithm.state`          | `ExecutionAlgorithm.state` remains a property                 |
+| `Component.is_running`         | `is_running()`                                                |
+| `Component.is_stopped`         | `is_stopped()`                                                |
+| `Component.is_disposed`        | `is_disposed()`                                               |
+| `Component.is_degraded`        | `is_degraded()`                                               |
+| `Component.is_faulted`         | `is_faulted()`                                                |
+
+V1 `is_initialized` means that a component has advanced beyond `PRE_INITIALIZED`. V2 `is_ready()`
+means exactly `READY`, so it is not an equivalent replacement while a component is running,
+stopped, degraded, disposed, or faulted. Inspect `state()` on `DataActor` and `Strategy`, or the
+`state` property on `ExecutionAlgorithm`, and compare it with `ComponentState.PRE_INITIALIZED`.
+
+Read the v1 `Strategy` runtime properties `order_id_tag`, `oms_type`, `external_order_claims`,
+`manage_contingent_orders`, `manage_gtd_expiry`, `use_uuid_client_order_ids`, and
+`use_hyphens_in_client_order_ids` through the same-name properties on `Strategy.config`. The two
+client-order-ID formatting options on a strategy-owned `OrderFactory` use the same config. A
+standalone factory has no equivalent flag readback.
+
+Historical requests use type-specific batch callbacks in v2:
+
+| v1 data through `on_historical_data` | v2 callback                   | v2 argument                   |
+| ------------------------------------ | ----------------------------- | ----------------------------- |
+| Custom data                          | `on_historical_data`          | One `CustomData`              |
+| Book snapshot                        | `on_book`                     | One `OrderBook`               |
+| Book deltas                          | `on_historical_book_deltas`   | `Sequence[OrderBookDelta]`    |
+| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth10]`  |
+| Quote ticks                          | `on_historical_quotes`        | `Sequence[QuoteTick]`         |
+| Trade ticks                          | `on_historical_trades`        | `Sequence[TradeTick]`         |
+| Funding rates                        | `on_historical_funding_rates` | `Sequence[FundingRateUpdate]` |
+| Bars                                 | `on_historical_bars`          | `Sequence[Bar]`               |
+
+Typed historical results no longer fall through to `on_historical_data`; that hook handles custom
+data. `on_historical_mark_prices` and `on_historical_index_prices` are available for native batch
+delivery, but the current public Python API does not initiate those requests.
+
+The generic `on_event` hook is removed. Replace timer handling with `on_time_event`, aggregate order
+handling with `on_order_event`, and aggregate position handling with `on_position_event`. For
+custom messaging, use `on_signal` or a typed data subscription instead of overriding `on_event`.
+
+Python v2 `ExecutionAlgorithm` does not inherit the full actor surface. Move market-data and
+historical callbacks to `DataActor` or `Strategy`. Its inherited v1 `on_save` and `on_load` hooks
+also have no v2 algorithm callback; retain that state in application configuration or move the
+stateful component to `DataActor` or `Strategy`. Change `on_order_list(self, order_list)` to
+`on_order_list(self, order_list, orders)`.
+
+V2 strategy order changes take client order IDs rather than order objects:
+
+| v1 method                    | v2 method                                  |
+| ---------------------------- | ------------------------------------------ |
+| `modify_order(order, ...)`   | `modify_order(order.client_order_id, ...)` |
+| `cancel_order(order, ...)`   | `cancel_order(order.client_order_id, ...)` |
+| `cancel_orders(orders, ...)` | `cancel_orders(client_order_ids, ...)`     |
+
 ### Inspection and state renames
 
 V2 exposes consistent read-only inspection across economic instrument types. Properties include
@@ -93,7 +174,7 @@ precision and increment, and timestamps instead.
 Several v1 inspection names have direct v2 replacements:
 
 | v1 name                                              | v2 name                               |
-|------------------------------------------------------|---------------------------------------|
+| ---------------------------------------------------- | ------------------------------------- |
 | `instrument.symbol`                                  | `instrument.id.symbol`                |
 | `instrument.venue`                                   | `instrument.id.venue`                 |
 | `instrument.activation_utc`                          | `instrument.activation_ns`            |
@@ -126,7 +207,7 @@ Potential credentials and consumed callbacks use bounded inspection properties i
 readback:
 
 | Constructor field                                    | Inspection property                   |
-|------------------------------------------------------|---------------------------------------|
+| ---------------------------------------------------- | ------------------------------------- |
 | `BacktestDataConfig.catalog_fs_storage_options`      | `catalog_fs_storage_option_keys`      |
 | `BacktestDataConfig.catalog_fs_rust_storage_options` | `catalog_fs_rust_storage_option_keys` |
 | `SocketConfig.handler`                               | `has_handler`                         |
@@ -160,12 +241,36 @@ Databento configuration also changes shape:
   `reconnect_timeout_mins` are not accepted by the v2 live-node config. Reconnection remains an
   internal client concern; do not copy those v1 fields into v2 config construction.
 
+Interactive Brokers legacy mutation fields have constructor or builder replacements:
+
+| V1 field or alias         | V2 replacement                                                                  |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| `legacy_market_data_type` | Pass `market_data_type` to `InteractiveBrokersDataClientConfig`.                |
+| `legacy_load_ids`         | Pass `load_ids` to `InteractiveBrokersInstrumentProviderConfig`.                |
+| `legacy_load_contracts`   | Pass `load_contracts` to the instrument provider config.                        |
+| `legacy_symbology_method` | Pass `symbology_method` to the instrument provider config.                      |
+| `pickle_path`             | Pass or set `cache_path` on the instrument provider config.                     |
+| `routing`                 | Pass `RoutingConfig` to `LiveNodeBuilder.add_data_client` or `add_exec_client`. |
+| `dockerized_gateway`      | Start the gateway outside v2, then pass its `host` and `port`.                  |
+
+V2 retains writable `instrument_provider` fields on the data and execution client configs and
+`cache_path` on the provider config. A non‑`None` `dockerized_gateway` is rejected because Python
+v2 does not own the container lifecycle.
+
 V1 types from `nautilus_trader.config` move beside their owning runtime. For example,
 `BacktestRunConfig` comes from `nautilus_trader.backtest` and `PortfolioConfig` from
 `nautilus_trader.portfolio`.
 
-Use the generated type stubs in `python/nautilus_trader/` as the exact Python contract. The
-[Python v2 examples][python-v2-examples] show current live-node builders, adapter factories,
+Use the generated type stubs in `python/nautilus_trader/` as the supported Python contract. Some
+adapter wire DTOs expose extra runtime attributes that are not part of that contract. The following
+methods are callable at runtime but absent from the stubs, so static type checkers cannot resolve
+them:
+
+- `KrakenFuturesHttpClient.edit_orders_batch`
+- `KrakenFuturesHttpClient.submit_orders_batch`
+- `KrakenSpotHttpClient.submit_orders_batch`
+
+The [Python v2 examples][python-v2-examples] show current live-node builders, adapter factories,
 strategies, actors, and data/execution testers.
 
 Python v2 strategies subclass `Strategy` and override lifecycle or data callbacks:
@@ -221,7 +326,7 @@ shared wrappers provide normal inspection without exposing runtime internals.
 Choose the lifecycle method based on who owns the loop:
 
 | Method    | Contract                                                                                    |
-|-----------|---------------------------------------------------------------------------------------------|
+| --------- | ------------------------------------------------------------------------------------------- |
 | `run()`   | Owns the full lifecycle and blocks until shutdown.                                          |
 | `start()` | Completes startup and returns, but does not service post-start channel traffic.             |
 | `poll()`  | Processes traffic queued at call entry, returns its count, and does not wait for more.      |
@@ -262,6 +367,7 @@ Python v2 `ExecutionAlgorithm` remains a routed-order component rather than inhe
 `Actor` authoring surface. Supported override points include:
 
 - `on_order`
+- `on_order_list`
 - Order and position callbacks
 - Lifecycle callbacks
 - `on_signal`
@@ -269,10 +375,17 @@ Python v2 `ExecutionAlgorithm` remains a routed-order component rather than inhe
 The runtime owns command routing and calls `execute`; do not call or override `execute` as the
 algorithm entrypoint.
 
+V2 `OrderList` stores client order IDs instead of order objects. The runtime resolves those IDs
+through the cache and calls `on_order_list(order_list, orders)`, where `orders` follows the client
+order ID order. If the subclass overrides `on_order_list`, it receives one list callback and the
+runtime does not also call `on_order`. Without an override, the default implementation calls
+`on_order` once for each resolved order. Change v1 one‑argument overrides to accept `orders`; the
+v1 default did not fan out order lists.
+
 The supported authoring surface has these v1 dispositions:
 
 | V1 `ExecAlgorithm` / `Actor` capability | Python v2 contract                                                            |
-|-----------------------------------------|-------------------------------------------------------------------------------|
+| --------------------------------------- | ----------------------------------------------------------------------------- |
 | `cache`                                 | Available as a read-only property after node or engine registration.          |
 | `portfolio`                             | Available as a read-only property after node or engine registration.          |
 | `greeks`                                | Construct `GreeksCalculator(self.cache, self.clock)` after registration.      |
@@ -311,10 +424,55 @@ class RoutedAlgorithm(ExecutionAlgorithm):
         self.log.info(f"Routing {instrument.id}; portfolio ready={portfolio_ready}")
 ```
 
+Order `exec_algorithm_params` keys and values remain string‑only across the v2 model and Python
+bindings. Encode each value as a string when constructing the order, then parse it in the algorithm.
+For example, pass `exec_algorithm_params={"horizon_secs": "300", "interval_secs": "10"}`, not
+numeric values. This keeps Python authoring aligned with the Rust `IndexMap<Ustr, Ustr>` contract.
+
+`ExecutionAlgorithmConfig` supports Python subclasses with custom fields. The inherited
+`__new__` applies the base fields before the Python `__init__` runs, so the subclass initializes
+only its custom attributes. Keep `**_kwargs` so the subclass accepts the base keywords. The base
+constructor ignores other unmatched keywords, so validate optional custom inputs in `__init__`.
+
+```python
+from nautilus_trader.model import ExecAlgorithmId
+from nautilus_trader.trading import ExecutionAlgorithmConfig
+
+
+class RoutedAlgorithmConfig(ExecutionAlgorithmConfig):
+    def __init__(
+        self,
+        horizon_secs: str,
+        interval_secs: str,
+        **_kwargs,
+    ) -> None:
+        self.horizon_secs = horizon_secs
+        self.interval_secs = interval_secs
+
+
+config = RoutedAlgorithmConfig(
+    exec_algorithm_id=ExecAlgorithmId("ROUTED"),
+    horizon_secs="300",
+    interval_secs="10",
+    log_events=False,
+)
+algorithm = RoutedAlgorithm(config)
+```
+
+If an algorithm subclass defines `__init__`, call `super().__init__(config)` to retain its Python
+instance and config for export.
+
+Define the algorithm and config classes at module scope so the exported import paths resolve.
+
 Constructed instances and importable configs work in backtest and live workflows:
 
-- Register v2 `ExecutionAlgorithm` instances with `LiveNode.add_exec_algorithm`.
-- Register DataActor-based compatibility algorithms with `add_exec_algorithm_from_config`.
+- Register v2 `ExecutionAlgorithm` instances with `BacktestEngine.add_exec_algorithm` or
+  `LiveNode.add_exec_algorithm`.
+- Call `algorithm.to_importable_config()` to export the algorithm path, config path, and config
+  values.
+- Register the result with `BacktestEngine.add_exec_algorithm_from_config` or
+  `LiveNode.add_exec_algorithm_from_config`.
+- Register DataActor‑based compatibility algorithms with `add_exec_algorithm_from_config`.
 
 Nodes normally drive lifecycle transitions. Direct lifecycle methods remain available for
 control-plane integrations and dispatch the same Python callbacks.
@@ -322,9 +480,9 @@ control-plane integrations and dispatch the same Python callbacks.
 Port one workflow at a time and verify the generated stub before replacing a v1 convenience method.
 Do not assume that a v1 adapter config field also exists on its v2 Rust config.
 
-## Accepted contract differences
+## Behavior changes
 
-The cutover accepts these differences from v1:
+Account for these differences from v1:
 
 - Custom data flows as native `CustomData` without the v1 wrapper semantics.
 - v2 caches `OptionGreeks` for option fee calculation; this extends v1.
@@ -334,23 +492,34 @@ The cutover accepts these differences from v1:
 - `PortfolioConfig.use_mark_prices` defaults to `true`; v1 defaulted to `false`. Set it to `false` to
   skip mark prices.
 - v2 `OrderList` stores client order IDs instead of order objects:
-  - Replace `order_list.orders` with `order_list.client_order_ids()`, then resolve each ID through
-    `cache.order(client_order_id)`.
+  - Use the resolved `orders` argument in `ExecutionAlgorithm.on_order_list(order_list, orders)`.
+  - Elsewhere, replace `order_list.orders` with `order_list.client_order_ids()`, then resolve each
+    ID through `cache.order(client_order_id)`.
   - Replace `order_list.first` with `cache.order(order_list.first_client_order_id)` after checking
     the ID is not `None`.
 - Catalog order-event data written before `activation_price` and `OrderFilled.info` were added cannot
   be read by the new schema. Regenerate or migrate that data before upgrading a catalog in place.
+- `Order.avg_px` and `Order.slippage` are `decimal.Decimal`, where v1 exposes `float`. v2 no longer
+  converts the weighted average through `f64`, so comparisons against float literals can fail on a
+  fractional value: `Decimal("0.70000") == 0.7` is `False`. Compare against `Decimal("0.7")`, or wrap
+  the operand with `Decimal(str(value))`.
+- `Order.to_dict()` returns `avg_px` and `slippage` as strings, matching how the other decimal
+  fields already serialize. Wrap the value in `Decimal(...)` before doing arithmetic on it.
+- Postgres-backed deployments must run `nautilus database init` before starting a v2 node. The
+  `order.avg_px` and `order.slippage` columns move from `double precision` to `NUMERIC`, and the node
+  now fails at connect time while the old column types remain.
 
-## Deferred limits
+## Known limitations
 
 These gaps can affect migration but do not block supported cutover workflows:
 
-- Python request callback, join, and pending-request convenience semantics are not complete.
+- Python request callbacks do not provide v1 joined-response, pending-request cleanup, or late and
+  duplicate delivery convenience behavior.
 - Python cannot inject Redis cache databases or external message-bus backing factories into
   `LiveNode`; Rust builders still expose those backings.
 - SQL cache position and synthetic loads, actor and strategy state persistence, and heartbeat remain
-  incomplete. The audited restart workflow uses the Redis backing through Rust builders; Python
-  `LiveNode` configuration cannot select that backing yet.
+  incomplete. Redis backing is available through Rust builders, but Python `LiveNode` configuration
+  cannot select it.
 - External message-bus publishing of serialized order and position snapshots remains deferred.
 - V2 `BacktestNode` does not yet support the v1 `StreamingConfig` and `DataCatalogConfig` iterator
   workflow.

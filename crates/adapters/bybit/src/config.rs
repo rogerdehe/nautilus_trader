@@ -216,6 +216,9 @@ pub struct BybitExecClientConfig {
     /// Heartbeat interval in seconds for WebSocket clients.
     #[builder(default = 5)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication wait timeout (seconds), defaulting to
+    /// the client default when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
@@ -224,6 +227,11 @@ pub struct BybitExecClientConfig {
     /// Whether to generate position reports from wallet balances for SPOT positions.
     #[builder(default)]
     pub use_spot_position_reports: bool,
+    /// Whether to automatically repay SPOT margin borrows after BUY orders tracked by
+    /// this client and reported on the standard `execution` channel (not `execution.fast`)
+    /// fully fill.
+    #[builder(default)]
+    pub auto_repay_spot_borrows: bool,
     /// Leverage configuration for futures (symbol -> leverage).
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Position mode configuration for symbols (symbol -> mode).
@@ -247,9 +255,11 @@ nautilus_core::impl_pyo3_config_getters!(BybitExecClientConfig {
     retry_delay_initial_ms: u64,
     retry_delay_max_ms: u64,
     heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
     recv_window_ms: u64,
     account_id: Option<AccountId>,
     use_spot_position_reports: bool,
+    auto_repay_spot_borrows: bool,
     margin_mode: Option<BybitMarginMode>,
     transport_backend: TransportBackend,
 });

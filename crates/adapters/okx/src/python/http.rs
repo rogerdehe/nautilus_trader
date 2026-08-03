@@ -35,7 +35,7 @@ use pyo3::{
 use super::{extract_optional_string, extract_optional_trigger_type};
 use crate::{
     common::enums::{
-        OKXEnvironment, OKXInstrumentType, OKXOrderStatus, OKXPositionMode, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXEnvironment, OKXInstrumentType, OKXPositionMode, OKXTradeMode,
     },
     http::{
         client::OKXHttpClient,
@@ -836,7 +836,7 @@ impl OKXHttpClient {
         instrument_id: Option<InstrumentId>,
         algo_id: Option<String>,
         algo_client_order_id: Option<ClientOrderId>,
-        state: Option<OKXOrderStatus>,
+        state: Option<OKXAlgoOrderStatus>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -1079,6 +1079,9 @@ impl OKXHttpClient {
                     speed_bump,
                     outcome,
                     slippage_pct,
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;

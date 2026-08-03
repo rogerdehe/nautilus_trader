@@ -1,27 +1,26 @@
 # InstrumentStatus
 
-`InstrumentStatus` represents a change in the trading state of an instrument. It
-captures venue status events such as pre-open, trading, halt, pause, close, and
-short-selling restriction changes.
+`InstrumentStatus` represents a change in an instrument's trading state. It captures venue status
+events such as pre‑open, trading, halt, pause, close, and short‑selling restriction changes.
 
 ## Fields
 
-| Field                       | Rust type              | Python type   | Required/default | Notes                                      |
-|-----------------------------|------------------------|---------------|------------------|--------------------------------------------|
-| `instrument_id`             | `InstrumentId`         | `InstrumentId` | Required        | Instrument whose status changed.           |
-| `action`                    | `MarketStatusAction`   | `MarketStatusAction` | Required | Venue status action.                       |
-| `ts_event`                  | `UnixNanos`            | `int`         | Required         | Event timestamp in nanoseconds.            |
-| `ts_init`                   | `UnixNanos`            | `int`         | Required         | Initialization timestamp in nanoseconds.   |
-| `reason`                    | `Option<Ustr>`         | `str \| None`  | `None`           | Cause of the status change when provided.  |
-| `trading_event`             | `Option<Ustr>`         | `str \| None`  | `None`           | Venue event label when provided.           |
-| `is_trading`                | `Option<bool>`         | `bool \| None` | `None`           | Whether trading is enabled when known.     |
-| `is_quoting`                | `Option<bool>`         | `bool \| None` | `None`           | Whether quoting is enabled when known.     |
-| `is_short_sell_restricted`  | `Option<bool>`         | `bool \| None` | `None`           | Short‑sell restriction state when known.   |
+| Field                      | Rust type            | Python type          | Required/default | Notes                                     |
+| -------------------------- | -------------------- | -------------------- | ---------------- | ----------------------------------------- |
+| `instrument_id`            | `InstrumentId`       | `InstrumentId`       | Required         | Instrument whose status changed.          |
+| `action`                   | `MarketStatusAction` | `MarketStatusAction` | Required         | Venue status action.                      |
+| `ts_event`                 | `UnixNanos`          | `int`                | Required         | Event timestamp in nanoseconds.           |
+| `ts_init`                  | `UnixNanos`          | `int`                | Required         | Initialization timestamp in nanoseconds.  |
+| `reason`                   | `Option<Ustr>`       | `str \| None`        | `None`           | Cause of the status change when provided. |
+| `trading_event`            | `Option<Ustr>`       | `str \| None`        | `None`           | Venue event label when provided.          |
+| `is_trading`               | `Option<bool>`       | `bool \| None`       | `None`           | Whether trading is enabled when known.    |
+| `is_quoting`               | `Option<bool>`       | `bool \| None`       | `None`           | Whether quoting is enabled when known.    |
+| `is_short_sell_restricted` | `Option<bool>`       | `bool \| None`       | `None`           | Short‑sell restriction state when known.  |
 
 ## Behavior
 
-- Optional booleans allow adapters to preserve venue-provided state without guessing.
-- `action` gives the normalized high-level status even when venue-specific details are
+- Optional booleans allow adapters to preserve venue‑provided state without guessing.
+- `action` gives the normalized high‑level status even when venue‑specific details are
   also stored in `reason` or `trading_event`.
 - Strategies can handle status updates through `on_instrument_status(...)`.
 
@@ -71,4 +70,4 @@ status = InstrumentStatus(
 
 - [InstrumentClose](instrument_close.md) covers instrument close price events.
 - [Instruments](../instruments/) covers instrument definitions.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

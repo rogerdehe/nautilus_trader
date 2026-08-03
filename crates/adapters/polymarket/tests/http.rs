@@ -31,7 +31,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, Method, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
@@ -39,19 +39,23 @@ use nautilus_common::{providers::InstrumentProvider, testing::wait_until_async};
 use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
 use nautilus_network::{http::HttpClient, retry::RetryConfig};
 use nautilus_polymarket::{
-    common::{credential::Credential, enums::PolymarketOrderType},
+    common::{
+        credential::Credential,
+        enums::{PolymarketOrderType, SignatureType},
+    },
     config::{PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig},
     filters::{
         EventParamsFilter, EventSlugFilter, GammaQueryFilter, MarketSlugFilter, SearchFilter,
         TagFilter,
     },
     http::{
-        clob::PolymarketClobHttpClient,
+        clob::{HeartbeatResponse, PolymarketClobHttpClient},
         data_api::PolymarketDataApiHttpClient,
+        error::Error,
         gamma::{PolymarketGammaHttpClient, PolymarketGammaRawHttpClient},
         models::PolymarketOrder,
         query::{
-            CancelMarketOrdersParams, GetBalanceAllowanceParams, GetGammaEventsParams,
+            AssetType, CancelMarketOrdersParams, GetBalanceAllowanceParams, GetGammaEventsParams,
             GetGammaMarketsParams, GetOrdersParams, GetSearchParams, GetTradesParams,
         },
     },
@@ -76,7 +80,12 @@ struct TestServerState {
     request_count: Arc<tokio::sync::Mutex<usize>>,
     last_body: Arc<tokio::sync::Mutex<Option<Value>>>,
     last_headers: Arc<tokio::sync::Mutex<AHashMap<String, String>>>,
+    last_method: Arc<tokio::sync::Mutex<Option<Method>>>,
+    last_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    heartbeat_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    heartbeat_response: Arc<tokio::sync::Mutex<Value>>,
     rate_limit_after: Arc<AtomicUsize>,
+    rate_limit_response_headers: Arc<tokio::sync::Mutex<HeaderMap>>,
     /// Delay before `handle_get_orders` responds. Used by the timeout test.
     get_orders_delay_secs: Arc<AtomicUsize>,
     orders_pages: Arc<tokio::sync::Mutex<VecDeque<Value>>>,
@@ -105,7 +114,14 @@ impl Default for TestServerState {
             request_count: Arc::new(tokio::sync::Mutex::new(0)),
             last_body: Arc::new(tokio::sync::Mutex::new(None)),
             last_headers: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
+            last_method: Arc::new(tokio::sync::Mutex::new(None)),
+            last_path: Arc::new(tokio::sync::Mutex::new(None)),
+            heartbeat_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            heartbeat_response: Arc::new(tokio::sync::Mutex::new(json!({
+                "heartbeat_id": "heartbeat-next",
+            }))),
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)),
+            rate_limit_response_headers: Arc::new(tokio::sync::Mutex::new(HeaderMap::new())),
             get_orders_delay_secs: Arc::new(AtomicUsize::new(0)),
             orders_pages: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -210,13 +226,15 @@ async fn maybe_rate_limit(state: &TestServerState) -> Option<Response> {
     *count += 1;
     let limit = state.rate_limit_after.load(Ordering::Relaxed);
     if *count > limit {
-        Some(
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error": "Rate limit exceeded"})),
-            )
-                .into_response(),
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "Rate limit exceeded"})),
         )
+            .into_response();
+        response
+            .headers_mut()
+            .extend(state.rate_limit_response_headers.lock().await.clone());
+        Some(response)
     } else {
         None
     }
@@ -254,6 +272,22 @@ async fn handle_get_balance(State(state): State<TestServerState>, headers: Heade
     Json(load_json("http_balance_allowance_collateral.json")).into_response()
 }
 
+async fn handle_update_balance(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    *state.last_headers.lock().await = extract_headers(&headers);
+    *state.last_path.lock().await = Some("/balance-allowance/update".to_string());
+    if params.get("asset_type").map(String::as_str) == Some("COLLATERAL")
+        && params.get("signature_type").map(String::as_str) == Some("0")
+    {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::BAD_REQUEST.into_response()
+    }
+}
+
 async fn handle_post_order(
     State(state): State<TestServerState>,
     headers: HeaderMap,
@@ -268,6 +302,28 @@ async fn handle_post_order(
         *state.last_body.lock().await = Some(v);
     }
     Json(load_json("http_order_response_ok.json")).into_response()
+}
+
+async fn handle_post_orders(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(r) = maybe_rate_limit(&state).await {
+        return r;
+    }
+    *state.last_headers.lock().await = extract_headers(&headers);
+
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let response_count = value.as_array().map_or(0, Vec::len);
+    *state.last_body.lock().await = Some(value);
+    Json(Value::Array(vec![
+        load_json("http_order_response_ok.json");
+        response_count
+    ]))
+    .into_response()
 }
 
 async fn handle_delete_order(
@@ -325,6 +381,23 @@ async fn handle_cancel_market(
         *state.last_body.lock().await = Some(v);
     }
     Json(load_json("http_batch_cancel_response.json")).into_response()
+}
+
+async fn handle_heartbeat(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    *state.last_headers.lock().await = extract_headers(&headers);
+    *state.last_method.lock().await = Some(Method::POST);
+    *state.last_path.lock().await = Some("/heartbeats".to_string());
+    if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+        *state.last_body.lock().await = Some(value);
+    }
+
+    let status = *state.heartbeat_response_status.lock().await;
+    let response = state.heartbeat_response.lock().await.clone();
+    (status, Json(response)).into_response()
 }
 
 async fn handle_gamma_markets(
@@ -555,13 +628,18 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/data/order/{id}", get(handle_get_order))
         .route("/data/trades", get(handle_get_trades))
         .route("/balance-allowance", get(handle_get_balance))
+        .route("/balance-allowance/update", get(handle_update_balance))
         .route(
             "/order",
             post(handle_post_order).delete(handle_delete_order),
         )
-        .route("/orders", delete(handle_delete_orders))
+        .route(
+            "/orders",
+            post(handle_post_orders).delete(handle_delete_orders),
+        )
         .route("/cancel-all", delete(handle_cancel_all))
         .route("/cancel-market-orders", delete(handle_cancel_market))
+        .route("/heartbeats", post(handle_heartbeat))
         .route("/markets", get(handle_gamma_markets))
         .route("/markets/keyset", get(handle_gamma_markets_keyset))
         .route("/events", get(handle_gamma_events))
@@ -644,6 +722,35 @@ async fn test_get_balance_allowance_returns_data() {
     assert_eq!(
         balance.allowance,
         Some(rust_decimal_macros::dec!(999_999_999_000_000)),
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_update_balance_allowance_accepts_empty_response() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_clob_client(&addr);
+
+    client
+        .update_balance_allowance(GetBalanceAllowanceParams {
+            asset_type: Some(AssetType::Collateral),
+            signature_type: Some(SignatureType::Eoa),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.last_path.lock().await.as_deref(),
+        Some("/balance-allowance/update")
+    );
+    assert!(
+        state
+            .last_headers
+            .lock()
+            .await
+            .contains_key("poly_signature")
     );
 }
 
@@ -757,6 +864,87 @@ async fn test_authenticated_requests_include_poly_headers() {
 
 #[rstest]
 #[tokio::test]
+async fn test_post_heartbeat_sends_chained_body_and_l2_headers() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_clob_client(&addr);
+
+    let response = client.post_heartbeat("heartbeat-current").await.unwrap();
+
+    let headers = state.last_headers.lock().await;
+    let timestamp = &headers["poly_timestamp"];
+    let body = serde_json::to_string(&json!({
+        "heartbeat_id": "heartbeat-current",
+    }))
+    .unwrap();
+    let expected_signature = test_credential().sign(timestamp, "POST", "/heartbeats", &body);
+
+    assert_eq!(
+        response,
+        HeartbeatResponse::Acknowledged(Some("heartbeat-next".to_string()))
+    );
+    assert_eq!(*state.last_method.lock().await, Some(Method::POST));
+    assert_eq!(state.last_path.lock().await.as_deref(), Some("/heartbeats"));
+    assert_eq!(
+        state.last_body.lock().await.as_ref(),
+        Some(&json!({
+            "heartbeat_id": "heartbeat-current",
+        }))
+    );
+    assert_eq!(headers["poly_address"], TEST_ADDRESS);
+    assert_eq!(headers["poly_api_key"], "test_api_key");
+    assert_eq!(headers["poly_passphrase"], "test_pass");
+    assert_eq!(headers["poly_signature"], expected_signature);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_post_heartbeat_accepts_status_ok_response() {
+    let state = TestServerState::default();
+    *state.heartbeat_response.lock().await = json!({"status": "ok"});
+    let addr = start_mock_server(state).await;
+    let client = create_clob_client(&addr);
+
+    let response = client.post_heartbeat("").await.unwrap();
+
+    assert_eq!(response, HeartbeatResponse::Acknowledged(None));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_post_heartbeat_returns_replacement_id_from_bad_request() {
+    let state = TestServerState::default();
+    *state.heartbeat_response_status.lock().await = StatusCode::BAD_REQUEST;
+    *state.heartbeat_response.lock().await = json!({"heartbeat_id": "heartbeat-current"});
+    let addr = start_mock_server(state).await;
+    let client = create_clob_client(&addr);
+
+    let response = client.post_heartbeat("heartbeat-expired").await.unwrap();
+
+    assert_eq!(
+        response,
+        HeartbeatResponse::Resynchronize("heartbeat-current".to_string())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_post_heartbeat_rejects_unknown_success_response() {
+    let state = TestServerState::default();
+    *state.heartbeat_response.lock().await = json!({"status": "rejected"});
+    let addr = start_mock_server(state).await;
+    let client = create_clob_client(&addr);
+
+    let error = client.post_heartbeat("").await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "exchange error: Heartbeat acknowledgment was invalid"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_rate_limit_returns_error() {
     let state = TestServerState::default();
     state.rate_limit_after.store(2, Ordering::Relaxed);
@@ -769,6 +957,181 @@ async fn test_rate_limit_returns_error() {
     // Third request exceeds the limit
     let result = client.get_orders(GetOrdersParams::default()).await;
     assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_order_rate_limit_preserves_retry_after_and_is_definitive() {
+    let state = TestServerState::default();
+    state.rate_limit_after.store(0, Ordering::Relaxed);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("poly-ratelimit-remaining"),
+        "0".parse().unwrap(),
+    );
+    response_headers.insert(
+        HeaderName::from_static("poly-ratelimit-tier"),
+        "Standard".parse().unwrap(),
+    );
+    response_headers.insert(HeaderName::from_static("retry-after"), "2".parse().unwrap());
+    *state.rate_limit_response_headers.lock().await = response_headers;
+    let addr = start_mock_server(state).await;
+    let client = PolymarketClobHttpClient::new(
+        test_credential(),
+        "0x0000000000000000000000000000000000000248".to_string(),
+        Some(format!("http://{addr}")),
+        5,
+    )
+    .unwrap();
+    let order: PolymarketOrder =
+        serde_json::from_value(load_json("http_signed_order.json")).unwrap();
+
+    let error = client
+        .post_order(&order, PolymarketOrderType::GTC, false)
+        .await
+        .unwrap_err();
+
+    let Error::RateLimit {
+        endpoint,
+        token_cost,
+        retry_after_ms,
+    } = &error
+    else {
+        panic!("expected rate-limit error, was {error}");
+    };
+    assert_eq!(*endpoint, "/order");
+    assert_eq!(*token_cost, 1);
+    assert_eq!(*retry_after_ms, Some(2_000));
+    assert!(error.is_retryable());
+    assert!(!error.is_submit_outcome_unknown());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_batch_order_rate_limit_reports_entry_cost() {
+    let state = TestServerState::default();
+    state.rate_limit_after.store(0, Ordering::Relaxed);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(HeaderName::from_static("retry-after"), "1".parse().unwrap());
+    *state.rate_limit_response_headers.lock().await = response_headers;
+    let addr = start_mock_server(state).await;
+    let client = PolymarketClobHttpClient::new(
+        test_credential(),
+        "0x0000000000000000000000000000000000000249".to_string(),
+        Some(format!("http://{addr}")),
+        5,
+    )
+    .unwrap();
+    let order: PolymarketOrder =
+        serde_json::from_value(load_json("http_signed_order.json")).unwrap();
+    let orders = [
+        (&order, PolymarketOrderType::GTC, false),
+        (&order, PolymarketOrderType::GTC, false),
+        (&order, PolymarketOrderType::GTC, false),
+    ];
+
+    let error = client.post_orders(&orders).await.unwrap_err();
+
+    let Error::RateLimit {
+        endpoint,
+        token_cost,
+        retry_after_ms,
+    } = error
+    else {
+        panic!("expected rate-limit error");
+    };
+    assert_eq!(endpoint, "/orders");
+    assert_eq!(token_cost, 3);
+    assert_eq!(retry_after_ms, Some(1_000));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_batch_cancel_rate_limit_reports_submitted_id_cost() {
+    let state = TestServerState::default();
+    state.rate_limit_after.store(0, Ordering::Relaxed);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(HeaderName::from_static("retry-after"), "1".parse().unwrap());
+    *state.rate_limit_response_headers.lock().await = response_headers;
+    let addr = start_mock_server(state).await;
+    let client = PolymarketClobHttpClient::new(
+        test_credential(),
+        "0x0000000000000000000000000000000000000250".to_string(),
+        Some(format!("http://{addr}")),
+        5,
+    )
+    .unwrap();
+
+    let error = client
+        .cancel_orders(&["order-1", "order-2"])
+        .await
+        .unwrap_err();
+
+    let Error::RateLimit {
+        endpoint,
+        token_cost,
+        retry_after_ms,
+    } = error
+    else {
+        panic!("expected rate-limit error");
+    };
+    assert_eq!(endpoint, "/orders");
+    assert_eq!(token_cost, 2);
+    assert_eq!(retry_after_ms, Some(1_000));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_retry_after_delays_next_order_request() {
+    let state = TestServerState::default();
+    state.rate_limit_after.store(0, Ordering::Relaxed);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(HeaderName::from_static("retry-after"), "2".parse().unwrap());
+    *state.rate_limit_response_headers.lock().await = response_headers;
+    let addr = start_mock_server(state.clone()).await;
+    let client = PolymarketClobHttpClient::new(
+        test_credential(),
+        "0x0000000000000000000000000000000000000251".to_string(),
+        Some(format!("http://{addr}")),
+        5,
+    )
+    .unwrap();
+    let order: PolymarketOrder =
+        serde_json::from_value(load_json("http_signed_order.json")).unwrap();
+
+    let error = client
+        .post_order(&order, PolymarketOrderType::GTC, false)
+        .await
+        .unwrap_err();
+    tokio::time::pause();
+
+    assert!(matches!(
+        error,
+        Error::RateLimit {
+            endpoint: "/order",
+            token_cost: 1,
+            retry_after_ms: Some(2_000),
+        }
+    ));
+    state.rate_limit_after.store(usize::MAX, Ordering::Relaxed);
+
+    let retry_client = client.clone();
+    let retry_order = order.clone();
+
+    let retry = tokio::spawn(async move {
+        retry_client
+            .post_order(&retry_order, PolymarketOrderType::GTC, false)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(*state.request_count.lock().await, 1);
+
+    tokio::time::advance(Duration::from_millis(1_900)).await;
+    assert_eq!(*state.request_count.lock().await, 1);
+
+    tokio::time::resume();
+    retry.await.unwrap().unwrap();
+    assert_eq!(*state.request_count.lock().await, 2);
 }
 
 #[rstest]
@@ -2125,6 +2488,44 @@ async fn test_fetch_gamma_markets_stops_at_total_cap() {
 
 #[rstest]
 #[tokio::test]
+async fn test_fetch_gamma_markets_rejects_repeated_cursor() {
+    let state = TestServerState::default();
+    let market = gamma_market_with_slug(
+        "stuck-market",
+        "0xcondition_stuck_market",
+        ["97300000000000000001", "97300000000000000002"],
+    );
+    {
+        let mut pages = state.gamma_markets_pages.lock().await;
+        pages.push_back(json!({
+            "markets": [market.clone()],
+            "next_cursor": "stuck",
+        }));
+        pages.push_back(json!({
+            "markets": [market],
+            "next_cursor": "stuck",
+        }));
+    }
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let error = client
+        .request_markets_by_params(GetGammaMarketsParams {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Gamma market pagination repeated cursor \"stuck\""
+    );
+    assert_eq!(state.gamma_markets_query_log.lock().await.len(), 2);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_fetch_gamma_events_paginated_uses_next_cursor_and_500_limit() {
     let state = TestServerState::default();
     let market_a = gamma_market_with_slug(
@@ -2219,6 +2620,45 @@ async fn test_fetch_gamma_events_stops_at_total_cap() {
 
     assert_eq!(instruments.len(), 2);
     assert_eq!(state.gamma_events_query_log.lock().await.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fetch_gamma_events_rejects_repeated_cursor() {
+    let state = TestServerState::default();
+    let market = gamma_market_with_slug(
+        "stuck-event-market",
+        "0xcondition_stuck_event",
+        ["98300000000000000001", "98300000000000000002"],
+    );
+    let event = gamma_event_with_markets("stuck-event", &[market]);
+    {
+        let mut pages = state.gamma_events_pages.lock().await;
+        pages.push_back(json!({
+            "events": [event.clone()],
+            "next_cursor": "stuck",
+        }));
+        pages.push_back(json!({
+            "events": [event],
+            "next_cursor": "stuck",
+        }));
+    }
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let error = client
+        .request_events_by_params(GetGammaEventsParams {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Gamma event pagination repeated cursor \"stuck\""
+    );
+    assert_eq!(state.gamma_events_query_log.lock().await.len(), 2);
 }
 
 #[rstest]

@@ -40,7 +40,7 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Price, Quantity},
 };
@@ -93,8 +93,15 @@ pub(crate) struct OrderIdentity {
     pub(crate) order_side: OrderSide,
     pub(crate) order_type: OrderType,
     pub(crate) client_order_index: i64,
-    venue_order_id: Arc<Mutex<Option<VenueOrderId>>>,
+    binding: Arc<Mutex<OrderIdentityBinding>>,
     accepted_emitted: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct OrderIdentityBinding {
+    venue_order_id: Option<VenueOrderId>,
+    submission_nonce: Option<i64>,
+    external_venue_ids: AHashSet<VenueOrderId>,
 }
 
 impl OrderIdentity {
@@ -111,24 +118,55 @@ impl OrderIdentity {
             order_side,
             order_type,
             client_order_index,
-            venue_order_id: Arc::new(Mutex::new(None)),
+            binding: Arc::new(Mutex::new(OrderIdentityBinding::default())),
             accepted_emitted: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    fn restored(order: &OrderAny, client_order_index: i64, venue_order_id: VenueOrderId) -> Self {
+        let identity = Self::new(
+            order.instrument_id(),
+            order.strategy_id(),
+            order.order_side(),
+            order.order_type(),
+            client_order_index,
+        );
+        identity
+            .binding
+            .lock()
+            .expect(MUTEX_POISONED)
+            .venue_order_id = Some(venue_order_id);
+        identity.accepted_emitted.store(true, Ordering::Release);
+        identity
+    }
+
+    fn mark_submission(&self, nonce: i64) {
+        self.binding.lock().expect(MUTEX_POISONED).submission_nonce = Some(nonce);
+    }
+
     fn bind_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
-        let mut current = self.venue_order_id.lock().expect(MUTEX_POISONED);
-        match *current {
+        let mut binding = self.binding.lock().expect(MUTEX_POISONED);
+        match binding.venue_order_id {
             Some(existing) => existing == venue_order_id,
             None => {
-                *current = Some(venue_order_id);
+                if binding.external_venue_ids.contains(&venue_order_id)
+                    || binding.submission_nonce.is_none()
+                {
+                    binding.external_venue_ids.insert(venue_order_id);
+                    return false;
+                }
+                binding.venue_order_id = Some(venue_order_id);
                 true
             }
         }
     }
 
     fn matches_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
-        *self.venue_order_id.lock().expect(MUTEX_POISONED) == Some(venue_order_id)
+        self.binding.lock().expect(MUTEX_POISONED).venue_order_id == Some(venue_order_id)
+    }
+
+    fn venue_order_id(&self) -> Option<VenueOrderId> {
+        self.binding.lock().expect(MUTEX_POISONED).venue_order_id
     }
 
     fn accepted_was_emitted(&self) -> bool {
@@ -151,6 +189,7 @@ impl OrderIdentity {
 /// order event on a venue rejection.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSendTx {
+    pub(crate) connection_epoch: u64,
     pub(crate) kind: PendingSendTxKind,
     pub(crate) submitted_at: UnixNanos,
     pub(crate) nonce: i64,
@@ -193,6 +232,8 @@ pub(crate) enum PendingSendTxKind {
 /// degenerate seed never spins indefinitely while still leaving headroom.
 pub(crate) const CLOID_INDEX_PROBE_LIMIT: usize = 16;
 
+const CLOID_INDEX_MAX: u32 = 0x7FFF_FFFF;
+
 /// Maximum terminal orders and trade ids retained for reconnect replay.
 const REPLAY_CACHE_CAPACITY: usize = 100_000;
 
@@ -210,9 +251,9 @@ pub(crate) struct RetiredOrderCache {
 
 #[derive(Debug)]
 struct RetiredOrderCacheInner {
-    by_index: AHashMap<i64, (RetiredOrderIdentity, u64)>,
-    index_by_cloid: AHashMap<ClientOrderId, i64>,
-    queue: VecDeque<(i64, u64)>,
+    by_index: AHashMap<i64, AHashMap<Option<VenueOrderId>, (RetiredOrderIdentity, u64)>>,
+    by_cloid: AHashMap<ClientOrderId, (i64, Option<VenueOrderId>)>,
+    queue: VecDeque<(i64, Option<VenueOrderId>, u64)>,
     next_seq: u64,
 }
 
@@ -221,7 +262,7 @@ impl RetiredOrderCache {
         Self {
             inner: Mutex::new(RetiredOrderCacheInner {
                 by_index: AHashMap::with_capacity(capacity),
-                index_by_cloid: AHashMap::with_capacity(capacity),
+                by_cloid: AHashMap::with_capacity(capacity),
                 queue: VecDeque::with_capacity(capacity),
                 next_seq: 0,
             }),
@@ -231,45 +272,87 @@ impl RetiredOrderCache {
 
     fn insert(&self, cloid: ClientOrderId, identity: OrderIdentity) {
         let index = identity.client_order_index;
+        let venue_order_id = identity.venue_order_id();
+        let binding = (index, venue_order_id);
         let mut inner = self.inner.lock().expect(MUTEX_POISONED);
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.wrapping_add(1);
-        inner.index_by_cloid.insert(cloid, index);
-        inner
-            .by_index
-            .insert(index, (RetiredOrderIdentity { cloid, identity }, seq));
-        inner.queue.push_back((index, seq));
+
+        if let Some((old_index, old_venue_order_id)) = inner.by_cloid.get(&cloid).copied()
+            && (old_index, old_venue_order_id) != binding
+        {
+            let remove_index = inner.by_index.get_mut(&old_index).is_some_and(|bindings| {
+                bindings.remove(&old_venue_order_id);
+                bindings.is_empty()
+            });
+
+            if remove_index {
+                inner.by_index.remove(&old_index);
+            }
+        }
+
+        let replaced = inner.by_index.entry(index).or_default().insert(
+            venue_order_id,
+            (RetiredOrderIdentity { cloid, identity }, seq),
+        );
+
+        if let Some((old, _)) = replaced
+            && old.cloid != cloid
+        {
+            inner.by_cloid.remove(&old.cloid);
+        }
+        inner.by_cloid.insert(cloid, binding);
+        inner.queue.push_back((index, venue_order_id, seq));
 
         while inner.queue.len() > self.capacity
-            && let Some((old_index, old_seq)) = inner.queue.pop_front()
+            && let Some((old_index, old_venue_order_id, old_seq)) = inner.queue.pop_front()
         {
-            if inner.by_index.get(&old_index).map(|(_, seq)| *seq) == Some(old_seq)
-                && let Some((old, _)) = inner.by_index.remove(&old_index)
-            {
-                inner.index_by_cloid.remove(&old.cloid);
+            let removed = inner.by_index.get_mut(&old_index).and_then(|bindings| {
+                if bindings.get(&old_venue_order_id).map(|(_, seq)| *seq) != Some(old_seq) {
+                    return None;
+                }
+                let (old, _) = bindings.remove(&old_venue_order_id)?;
+                Some((old.cloid, bindings.is_empty()))
+            });
+
+            if let Some((old_cloid, remove_index)) = removed {
+                inner.by_cloid.remove(&old_cloid);
+                if remove_index {
+                    inner.by_index.remove(&old_index);
+                }
                 log::warn!(
-                    "Evicting retired Lighter order identity at replay-cache capacity: cloid={}, client_order_index={old_index}",
-                    old.cloid,
+                    "Evicting retired Lighter order identity at replay-cache capacity: cloid={old_cloid}, client_order_index={old_index}",
                 );
             }
         }
     }
 
     fn cloid_for_index(&self, index: i64) -> Option<ClientOrderId> {
+        let inner = self.inner.lock().expect(MUTEX_POISONED);
+        let bindings = inner.by_index.get(&index)?;
+        if bindings.len() != 1 {
+            return None;
+        }
+        bindings.values().next().map(|(retired, _)| retired.cloid)
+    }
+
+    fn cloid_for_venue(&self, index: i64, venue_order_id: VenueOrderId) -> Option<ClientOrderId> {
         self.inner
             .lock()
             .expect(MUTEX_POISONED)
             .by_index
-            .get(&index)
+            .get(&index)?
+            .get(&Some(venue_order_id))
             .map(|(retired, _)| retired.cloid)
     }
 
     fn identity_for_cloid(&self, cloid: &ClientOrderId) -> Option<OrderIdentity> {
         let inner = self.inner.lock().expect(MUTEX_POISONED);
-        let index = inner.index_by_cloid.get(cloid)?;
+        let (index, venue_order_id) = inner.by_cloid.get(cloid)?;
         inner
             .by_index
             .get(index)
+            .and_then(|bindings| bindings.get(venue_order_id))
             .map(|(retired, _)| retired.identity.clone())
     }
 
@@ -286,6 +369,12 @@ impl RetiredOrderCache {
 pub(crate) enum TradeDedupSource {
     Live,
     Reconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOrderAction {
+    Modify,
+    Cancel,
 }
 
 #[derive(Debug)]
@@ -412,6 +501,9 @@ pub(crate) struct WsDispatchState {
     /// is initialised on the first emitted `OrderAccepted` and refreshed
     /// on every emitted `OrderUpdated`.
     pub(crate) order_snapshots: Arc<DashMap<ClientOrderId, OrderShapeSnapshot>>,
+    /// Local lifecycle action that a venue frame or reconciliation report
+    /// must not bypass before its confirming event or rejection arrives.
+    pending_order_actions: Arc<DashMap<ClientOrderId, PendingOrderAction>>,
     /// FIFO queue of submits awaiting a venue response. The consumption loop
     /// pops on every `SendTxAck` / `SendTxRejected` so it can attribute a
     /// rejection back to the originating order (sendTx error frames carry no
@@ -630,6 +722,7 @@ impl WsDispatchState {
             seen_trade_ids: Arc::new(TradeDedupCache::new(REPLAY_CACHE_CAPACITY)),
             triggered_emitted: Arc::new(DashSet::new()),
             order_snapshots: Arc::new(DashMap::new()),
+            pending_order_actions: Arc::new(DashMap::new()),
             pending_sendtx: Arc::new(Mutex::new(VecDeque::new())),
             account_streams_ready: Arc::new(AccountStreamsReady::new()),
         }
@@ -641,6 +734,13 @@ impl WsDispatchState {
     /// a late venue ACK to the next-head. In normal operation ACKs arrive in
     /// milliseconds; sustained queue growth indicates a stuck WS read loop.
     pub(crate) fn enqueue_pending_sendtx(&self, pending: PendingSendTx) {
+        if let PendingSendTxKind::Create {
+            order,
+            client_order_index: _,
+        } = &pending.kind
+        {
+            self.mark_order_submission(&order.client_order_id(), pending.nonce);
+        }
         self.pending_sendtx
             .lock()
             .expect(MUTEX_POISONED)
@@ -664,39 +764,54 @@ impl WsDispatchState {
     /// Lighter does not always echo `tx_hash`. With two or more transactions
     /// in flight, FIFO attribution is unsafe because responses may arrive out
     /// of order.
-    pub(crate) fn pop_pending_sendtx_if_only(&self) -> Option<PendingSendTx> {
+    pub(crate) fn pop_pending_sendtx_if_only(
+        &self,
+        connection_epoch: u64,
+    ) -> Option<PendingSendTx> {
         let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        if queue.len() != 1 {
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, _) = matches.next()?;
+        if matches.next().is_some() {
             return None;
         }
-        queue.pop_front()
+        queue.remove(position)
     }
 
     /// Pop the sole pending entry only if its `submitted_at` is within
     /// `max_age_ms` of `now`.
     pub(crate) fn pop_pending_sendtx_if_only_within(
         &self,
+        connection_epoch: u64,
         now: UnixNanos,
         max_age_ms: u64,
     ) -> Option<PendingSendTx> {
         let cutoff_ns = now.as_u64().saturating_sub(max_age_ms * 1_000_000);
         let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        if queue.len() != 1 {
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, pending) = matches.next()?;
+        let fresh = pending.submitted_at.as_u64() >= cutoff_ns;
+        if matches.next().is_some() || !fresh {
             return None;
         }
-
-        match queue.front() {
-            Some(pending) if pending.submitted_at.as_u64() >= cutoff_ns => queue.pop_front(),
-            _ => None,
-        }
+        queue.remove(position)
     }
 
-    /// Remove a pending entry by nonce. Used by the spawn-failure path when
-    /// `send_tx` errors locally before the venue ever sees the message; the
-    /// nonce is unique per submit and reachable from every dispatch path.
-    pub(crate) fn remove_pending_sendtx_by_nonce(&self, nonce: i64) -> Option<PendingSendTx> {
+    /// Remove a pending entry by connection epoch and nonce.
+    pub(crate) fn remove_pending_sendtx_by_nonce(
+        &self,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> Option<PendingSendTx> {
         let mut q = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        let pos = q.iter().position(|p| p.nonce == nonce)?;
+        let pos = q
+            .iter()
+            .position(|p| p.connection_epoch == connection_epoch && p.nonce == nonce)?;
         q.remove(pos)
     }
 
@@ -704,27 +819,30 @@ impl WsDispatchState {
     /// (case-insensitive hex comparison, optional `0x` prefix tolerated).
     /// The venue echoes the hash the client computed at signing time, so a
     /// match is exact attribution regardless of queue position.
-    pub(crate) fn remove_pending_sendtx_by_hash(&self, tx_hash: &str) -> Option<PendingSendTx> {
+    pub(crate) fn remove_pending_sendtx_by_hash(
+        &self,
+        connection_epoch: u64,
+        tx_hash: &str,
+    ) -> Option<PendingSendTx> {
         let tx_hash = tx_hash
             .strip_prefix("0x")
             .or_else(|| tx_hash.strip_prefix("0X"))
             .unwrap_or(tx_hash);
         let mut q = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        let pos = q
-            .iter()
-            .position(|p| p.tx_hash.eq_ignore_ascii_case(tx_hash))?;
+        let pos = q.iter().position(|p| {
+            p.connection_epoch == connection_epoch && p.tx_hash.eq_ignore_ascii_case(tx_hash)
+        })?;
         q.remove(pos)
     }
 
-    /// Drain every pending entry. Used on reconnect: responses to txs sent
-    /// on the previous connection are lost, so retained entries would only
-    /// misattribute responses arriving on the new connection.
-    pub(crate) fn drain_pending_sendtx(&self) -> Vec<PendingSendTx> {
-        self.pending_sendtx
-            .lock()
-            .expect(MUTEX_POISONED)
-            .drain(..)
-            .collect()
+    /// Drain pending entries owned by one disconnected connection.
+    pub(crate) fn drain_pending_sendtx(&self, connection_epoch: u64) -> Vec<PendingSendTx> {
+        let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
+        let (drained, retained) = std::mem::take(&mut *queue)
+            .into_iter()
+            .partition(|pending| pending.connection_epoch == connection_epoch);
+        *queue = retained;
+        drained.into()
     }
 
     /// Returns the current pending-sendTx queue length. Test-only helper.
@@ -754,10 +872,44 @@ impl WsDispatchState {
         self.order_snapshots.insert(cloid, snapshot);
     }
 
+    pub(crate) fn set_pending_order_action(
+        &self,
+        cloid: ClientOrderId,
+        action: PendingOrderAction,
+    ) {
+        self.pending_order_actions.insert(cloid, action);
+    }
+
+    pub(crate) fn pending_order_action(&self, cloid: &ClientOrderId) -> Option<PendingOrderAction> {
+        self.pending_order_actions
+            .get(cloid)
+            .map(|entry| *entry.value())
+    }
+
+    pub(crate) fn clear_pending_order_action_if(
+        &self,
+        cloid: &ClientOrderId,
+        action: PendingOrderAction,
+    ) -> bool {
+        self.pending_order_actions
+            .remove_if(cloid, |_, current| *current == action)
+            .is_some()
+    }
+
+    pub(crate) fn clear_pending_order_action(&self, cloid: &ClientOrderId) {
+        self.pending_order_actions.remove(cloid);
+    }
+
     /// Register identity context for an order the client just dispatched.
     /// The consumption loop reads this to decide whether to emit typed events.
     pub(crate) fn register_order_identity(&self, cloid: ClientOrderId, identity: OrderIdentity) {
         self.order_identities.insert(cloid, identity);
+    }
+
+    pub(crate) fn mark_order_submission(&self, cloid: &ClientOrderId, nonce: i64) {
+        if let Some(identity) = self.order_identities.get(cloid) {
+            identity.mark_submission(nonce);
+        }
     }
 
     /// Drop the identity entry for `cloid` after a terminal event or
@@ -766,10 +918,12 @@ impl WsDispatchState {
         self.order_identities.remove(cloid);
         self.triggered_emitted.remove(cloid);
         self.order_snapshots.remove(cloid);
+        self.clear_pending_order_action(cloid);
     }
 
     /// Move a terminal order from active maps into the bounded replay cache.
     pub(crate) fn retire_order_identity(&self, cloid: &ClientOrderId) {
+        self.clear_pending_order_action(cloid);
         let Some((_, identity)) = self.order_identities.remove(cloid) else {
             return;
         };
@@ -897,6 +1051,23 @@ impl WsDispatchState {
     pub(crate) fn register_cloid(&self, index: i64, cloid: ClientOrderId) -> anyhow::Result<i64> {
         let mut candidate = index;
         for attempt in 0..=CLOID_INDEX_PROBE_LIMIT {
+            if self.resolve_client_order_index(candidate).is_some() {
+                if self
+                    .cloid_map
+                    .get(&candidate)
+                    .is_some_and(|entry| *entry.value() == cloid)
+                {
+                    return Ok(candidate);
+                }
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
+            if self.retired_orders.contains_index(candidate) {
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
             match self.cloid_map.entry(candidate) {
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
                     if self.retired_orders.contains_index(candidate) {
@@ -927,6 +1098,95 @@ impl WsDispatchState {
         )
     }
 
+    /// Restore an exact order identity observed during reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached order does not carry the same venue order ID, the client
+    /// index is outside the venue-safe range, or the binding conflicts with existing local state.
+    pub(crate) fn restore_reconciled_order(
+        &self,
+        order: &OrderAny,
+        client_order_index: i64,
+        venue_order_id: VenueOrderId,
+    ) -> anyhow::Result<()> {
+        let cloid = order.client_order_id();
+        let terminal = order.is_closed();
+        anyhow::ensure!(
+            order.venue_order_id() == Some(venue_order_id),
+            "cached Lighter order {cloid} does not match venue order ID {venue_order_id}",
+        );
+        anyhow::ensure!(
+            (0..=i64::from(CLOID_INDEX_MAX)).contains(&client_order_index),
+            "Lighter client_order_index {client_order_index} is outside the venue-safe range",
+        );
+
+        if let Some(existing) = self
+            .order_identities
+            .get(&cloid)
+            .map(|entry| entry.value().clone())
+        {
+            anyhow::ensure!(
+                existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "active Lighter order {cloid} conflicts with reconciliation binding",
+            );
+
+            if terminal {
+                self.retire_order_identity(&cloid);
+            } else if order.is_triggered() == Some(true) {
+                self.mark_triggered_emitted(cloid);
+            }
+            return Ok(());
+        }
+
+        if let Some(existing) = self.retired_orders.identity_for_cloid(&cloid) {
+            anyhow::ensure!(
+                terminal
+                    && existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "retired Lighter order {cloid} conflicts with reconciliation binding",
+            );
+            return Ok(());
+        }
+
+        let identity = OrderIdentity::restored(order, client_order_index, venue_order_id);
+
+        if terminal {
+            anyhow::ensure!(
+                self.retired_orders
+                    .cloid_for_venue(client_order_index, venue_order_id)
+                    .is_none(),
+                "retired Lighter binding conflicts at client_order_index {client_order_index} and venue order ID {venue_order_id}",
+            );
+            self.retired_orders.insert(cloid, identity);
+        } else {
+            if let Some(existing) = self.venue_id_map.get(&cloid) {
+                anyhow::ensure!(
+                    *existing.value() == venue_order_id,
+                    "active Lighter order {cloid} conflicts with venue order ID {venue_order_id}",
+                );
+            }
+
+            match self.cloid_map.entry(client_order_index) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    self.venue_id_map.insert(cloid, venue_order_id);
+                    self.order_identities.insert(cloid, identity);
+                    entry.insert(cloid);
+                    if order.is_triggered() == Some(true) {
+                        self.mark_triggered_emitted(cloid);
+                    }
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    anyhow::bail!(
+                        "active Lighter binding conflicts at client_order_index {client_order_index}",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drop a cloid registration (called from the spawn's error branch when
     /// the tx never reaches the wire).
     pub(crate) fn forget_cloid(&self, index: i64) {
@@ -942,7 +1202,7 @@ impl WsDispatchState {
     }
 
     /// Resolve and bind a live venue client id across active and replay caches.
-    pub(crate) fn resolve_live_cloid(
+    pub(crate) fn resolve_live_order_cloid(
         &self,
         raw_client_id: &str,
         venue_order_id: VenueOrderId,
@@ -950,11 +1210,34 @@ impl WsDispatchState {
         if raw_client_id.is_empty() || raw_client_id == "0" {
             return None;
         }
+
         let index = raw_client_id.parse::<i64>().ok()?;
-        let cloid = self.resolve_client_order_index(index)?;
-        self.order_identity(&cloid)?
-            .bind_venue_order_id(venue_order_id)
-            .then_some(cloid)
+
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && let Some(identity) = self.order_identity(&cloid)
+        {
+            if identity.matches_venue_order_id(venue_order_id) {
+                return Some(cloid);
+            }
+
+            if let Some(retired) = self.retired_orders.cloid_for_venue(index, venue_order_id) {
+                return Some(retired);
+            }
+
+            return identity
+                .bind_venue_order_id(venue_order_id)
+                .then_some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
+    }
+
+    pub(crate) fn resolve_live_trade_cloid(
+        &self,
+        raw_client_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        self.resolve_live_order_cloid(raw_client_id, venue_order_id)
     }
 
     fn resolve_client_order_index_for_venue(
@@ -962,10 +1245,15 @@ impl WsDispatchState {
         index: i64,
         venue_order_id: VenueOrderId,
     ) -> Option<ClientOrderId> {
-        let cloid = self.resolve_client_order_index(index)?;
-        self.order_identity(&cloid)?
-            .matches_venue_order_id(venue_order_id)
-            .then_some(cloid)
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && self
+                .order_identity(&cloid)
+                .is_some_and(|identity| identity.matches_venue_order_id(venue_order_id))
+        {
+            return Some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
     }
 
     /// Substitute a numeric venue cloid only when its venue order is bound.
@@ -978,6 +1266,36 @@ impl WsDispatchState {
                 .unwrap_or_else(|| ClientOrderId::new(report.venue_order_id.as_str()));
             report = report.with_client_order_id(resolved);
         }
+        report
+    }
+
+    /// Preserve an unresolved local modify or cancel across a non-terminal
+    /// working report. Confirming shape and terminal events clear the marker.
+    pub(crate) fn preserve_pending_order_status(
+        &self,
+        mut report: OrderStatusReport,
+    ) -> OrderStatusReport {
+        let Some(cloid) = report.client_order_id else {
+            return report;
+        };
+
+        if report.order_status.is_closed() {
+            self.clear_pending_order_action(&cloid);
+            return report;
+        }
+
+        if !matches!(
+            report.order_status,
+            OrderStatus::Accepted | OrderStatus::Triggered | OrderStatus::PartiallyFilled,
+        ) {
+            return report;
+        }
+
+        report.order_status = match self.pending_order_action(&cloid) {
+            Some(PendingOrderAction::Modify) => OrderStatus::PendingUpdate,
+            Some(PendingOrderAction::Cancel) => OrderStatus::PendingCancel,
+            None => return report,
+        };
         report
     }
 
@@ -1093,7 +1411,7 @@ pub(crate) fn derive_client_order_index_static(cloid: &ClientOrderId) -> i64 {
     // with `21727 invalid client order index`; the venue's accepted range
     // is not documented but observed empirically. Using a smaller window
     // also keeps collision risk negligible at session scale.
-    i64::from(h as u32 & 0x7FFF_FFFF)
+    i64::from(h as u32 & CLOID_INDEX_MAX)
 }
 
 /// Linear probe: advance the candidate index by 1, wrapping inside the
@@ -1101,7 +1419,7 @@ pub(crate) fn derive_client_order_index_static(cloid: &ClientOrderId) -> i64 {
 /// when the derived index collides with another in-flight cloid.
 fn next_probe_index(candidate: i64) -> i64 {
     let next = candidate.wrapping_add(1);
-    if (0..=0x7FFF_FFFF).contains(&next) {
+    if (0..=i64::from(CLOID_INDEX_MAX)).contains(&next) {
         next
     } else {
         0
@@ -1259,7 +1577,7 @@ pub(crate) async fn lookup_order_status_report(
         {
             report = report.with_client_order_id(cloid);
         }
-        Some(report)
+        Some(dispatch.preserve_pending_order_status(report))
     };
 
     let mut active_matches = active.orders.iter().filter(|order| matches_order(order));
@@ -2238,10 +2556,11 @@ mod tests {
                 42,
             ),
         );
+        state.mark_order_submission(&original, 9);
 
         let report = stub_open_order_status_report("42");
         assert_eq!(
-            state.resolve_live_cloid("42", report.venue_order_id),
+            state.resolve_live_order_cloid("42", report.venue_order_id),
             Some(original),
         );
         let translated = state.translate_order_cloid(report);
@@ -2270,6 +2589,93 @@ mod tests {
         assert_eq!(
             translated.client_order_id.map(|c| c.to_string()),
             Some("not-an-int".to_string()),
+        );
+    }
+
+    #[rstest]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Accepted,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Triggered,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Accepted,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Triggered,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingCancel
+    )]
+    fn preserve_pending_order_status_maps_working_report(
+        #[case] action: PendingOrderAction,
+        #[case] venue_status: OrderStatus,
+        #[case] expected: OrderStatus,
+    ) {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new(format!("PENDING-{action:?}-{venue_status:?}"));
+        state.set_pending_order_action(cid, action);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = venue_status;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(
+            preserved.venue_order_id,
+            VenueOrderId::new("281476929510110"),
+        );
+        assert_eq!(preserved.order_status, expected);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), Some(action));
+    }
+
+    #[rstest]
+    fn preserve_pending_order_status_clears_terminal_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-TERMINAL");
+        state.set_pending_order_action(cid, PendingOrderAction::Modify);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = OrderStatus::Filled;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(preserved.order_status, OrderStatus::Filled);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), None);
+    }
+
+    #[rstest]
+    fn clear_pending_order_action_if_keeps_different_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-DIFFERENT");
+        state.set_pending_order_action(cid, PendingOrderAction::Cancel);
+
+        assert!(!state.clear_pending_order_action_if(&cid, PendingOrderAction::Modify));
+        assert_eq!(
+            state.pending_order_action(&cid),
+            Some(PendingOrderAction::Cancel),
         );
     }
 
@@ -2311,10 +2717,11 @@ mod tests {
                 42,
             ),
         );
+        state.mark_order_submission(&original, 9);
 
         let report = stub_fill_report("42");
         assert_eq!(
-            state.resolve_live_cloid("42", report.venue_order_id),
+            state.resolve_live_trade_cloid("42", report.venue_order_id),
             Some(original),
         );
         let translated = state.translate_fill_cloid(report);
@@ -2380,8 +2787,9 @@ mod tests {
                 42,
             ),
         );
+        state.mark_order_submission(&original, 9);
         assert_eq!(
-            state.resolve_live_cloid("42", VenueOrderId::new("281476929510109")),
+            state.resolve_live_order_cloid("42", VenueOrderId::new("281476929510109")),
             Some(original),
         );
 
@@ -2796,6 +3204,7 @@ mod tests {
             .quantity(Quantity::from("0.01"))
             .build();
         PendingSendTx {
+            connection_epoch: 0,
             kind: PendingSendTxKind::Create {
                 order: Box::new(order),
                 client_order_index: nonce,
@@ -2809,6 +3218,7 @@ mod tests {
 
     fn stub_pending_other(nonce: i64, submitted_at_ns: u64) -> PendingSendTx {
         PendingSendTx {
+            connection_epoch: 0,
             kind: PendingSendTxKind::Other,
             submitted_at: UnixNanos::from(submitted_at_ns),
             nonce,
@@ -2861,7 +3271,7 @@ mod tests {
         let within = UnixNanos::from(submitted_ns + 500 * 1_000_000);
         assert!(
             state
-                .pop_pending_sendtx_if_only_within(within, 1_000)
+                .pop_pending_sendtx_if_only_within(0, within, 1_000)
                 .is_some(),
         );
 
@@ -2869,7 +3279,7 @@ mod tests {
         let outside = UnixNanos::from(submitted_ns + 1_500 * 1_000_000);
         assert!(
             state
-                .pop_pending_sendtx_if_only_within(outside, 1_000)
+                .pop_pending_sendtx_if_only_within(0, outside, 1_000)
                 .is_none(),
             "outside the attribution window the head must not pop",
         );
@@ -2903,7 +3313,7 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
 
         let removed = state
-            .remove_pending_sendtx_by_nonce(11)
+            .remove_pending_sendtx_by_nonce(0, 11)
             .expect("nonce 11 removed");
         assert!(matches!(removed.kind, PendingSendTxKind::Other));
         assert_eq!(removed.nonce, 11);
@@ -2924,18 +3334,18 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_create("B", 12, now.as_u64() + 2));
 
         let removed = state
-            .remove_pending_sendtx_by_hash("hash0b")
+            .remove_pending_sendtx_by_hash(0, "hash0b")
             .expect("hash for nonce 11 removed");
         assert_eq!(removed.nonce, 11);
         assert_eq!(state.pending_sendtx_len(), 2);
 
         assert!(
-            state.remove_pending_sendtx_by_hash("hash0b").is_none(),
+            state.remove_pending_sendtx_by_hash(0, "hash0b").is_none(),
             "removed hash must not match again",
         );
 
         let upper = state
-            .remove_pending_sendtx_by_hash("0xHASH0C")
+            .remove_pending_sendtx_by_hash(0, "0xHASH0C")
             .expect("hash comparison is case-insensitive and prefix-tolerant");
         assert_eq!(pending_cloid(&upper), Some(cloid("B")));
 
@@ -2950,13 +3360,55 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
         state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
 
-        let drained = state.drain_pending_sendtx();
+        let drained = state.drain_pending_sendtx(0);
 
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].nonce, 10);
         assert_eq!(drained[1].nonce, 11);
         assert_eq!(state.pending_sendtx_len(), 0);
-        assert!(state.drain_pending_sendtx().is_empty());
+        assert!(state.drain_pending_sendtx(0).is_empty());
+    }
+
+    #[rstest]
+    fn reconnect_drain_keeps_replacement_epoch_enqueues_on_both_sides_of_cleanup() {
+        let state = WsDispatchState::new();
+        let mut disconnected = stub_pending_create("OLD", 10, 10);
+        disconnected.connection_epoch = 4;
+        let mut replacement_before_cleanup = stub_pending_other(11, 11);
+        replacement_before_cleanup.connection_epoch = 5;
+
+        state.enqueue_pending_sendtx(disconnected);
+        state.enqueue_pending_sendtx(replacement_before_cleanup);
+
+        let drained = state.drain_pending_sendtx(4);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].connection_epoch, 4);
+        assert_eq!(drained[0].nonce, 10);
+        assert_eq!(pending_cloid(&drained[0]), Some(cloid("OLD")));
+
+        {
+            let queue = state.pending_sendtx.lock().expect(MUTEX_POISONED);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].connection_epoch, 5);
+            assert_eq!(queue[0].nonce, 11);
+            assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        }
+
+        let mut replacement_after_cleanup = stub_pending_create("NEW", 12, 12);
+        replacement_after_cleanup.connection_epoch = 5;
+        state.enqueue_pending_sendtx(replacement_after_cleanup);
+
+        let queue = state.pending_sendtx.lock().expect(MUTEX_POISONED);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|pending| (pending.connection_epoch, pending.nonce))
+                .collect::<Vec<_>>(),
+            vec![(5, 11), (5, 12)],
+        );
+        assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        assert_eq!(pending_cloid(&queue[1]), Some(cloid("NEW")));
     }
 
     #[rstest]

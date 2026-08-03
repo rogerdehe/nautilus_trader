@@ -19,23 +19,23 @@ The DeFi domain model lives in `nautilus_model::defi`.
 
 `Chain` defines the target blockchain and its default service endpoints.
 
-| Field                       | Type         | Description                                                        |
-|-----------------------------|--------------|--------------------------------------------------------------------|
-| `name`                      | `Blockchain` | Chain enum value, such as `Ethereum` or `Arbitrum`.                |
-| `chain_id`                  | `u32`        | EVM chain ID, such as `1` for Ethereum.                            |
-| `hypersync_url`             | `String`     | HyperSync endpoint, by default `https://{chain_id}.hypersync.xyz`. |
-| `rpc_url`                   | `Option`     | Optional direct RPC endpoint stored on the chain model.            |
-| `native_currency_decimals`  | `u8`         | Native gas token decimal precision, usually `18`.                  |
+| Field                      | Type         | Description                                                        |
+| -------------------------- | ------------ | ------------------------------------------------------------------ |
+| `name`                     | `Blockchain` | Chain enum value, such as `Ethereum` or `Arbitrum`.                |
+| `chain_id`                 | `u32`        | EVM chain ID, such as `1` for Ethereum.                            |
+| `hypersync_url`            | `String`     | HyperSync endpoint, by default `https://{chain_id}.hypersync.xyz`. |
+| `rpc_url`                  | `Option`     | Optional direct RPC endpoint stored on the chain model.            |
+| `native_currency_decimals` | `u8`         | Native gas token decimal precision, usually `18`.                  |
 
 Chains can be loaded by numeric ID with `Chain::from_chain_id` or by name with
 `Chain::from_chain_name`.
 
-| Chain family                | Code | Name         | Decimals |
-|-----------------------------|------|--------------|----------|
-| Ethereum and L2s            | ETH  | Ethereum     | 18       |
-| Polygon                     | POL  | Polygon      | 18       |
-| Avalanche                   | AVAX | Avalanche    | 18       |
-| BSC                         | BNB  | Binance Coin | 18       |
+| Chain family     | Code | Name         | Decimals |
+| ---------------- | ---- | ------------ | -------- |
+| Ethereum and L2s | ETH  | Ethereum     | 18       |
+| Polygon          | POL  | Polygon      | 18       |
+| Avalanche        | AVAX | Avalanche    | 18       |
+| BSC              | BNB  | Binance Coin | 18       |
 
 ### DEX and pools
 
@@ -45,8 +45,15 @@ DEX integrations register:
 - Event signatures and parser functions.
 - AMM type.
 
-Pool definitions bind the chain, DEX, pool contract, token pair, fee tier, tick spacing, and creation
-block into a stable Nautilus instrument ID.
+Pool definitions bind the chain and DEX to a pool contract address or protocol pool ID to form a
+stable Nautilus instrument ID. The token pair, fee tier, tick spacing, and creation block remain
+pool metadata.
+
+When the data engine processes a pool definition, it caches and publishes a `CurrencyPair` under
+the same pool instrument ID. The instrument keeps the raw pool `token0`/`token1` order as base/quote,
+derives price and size precision from token decimals up to `FIXED_PRECISION`, and exposes the fee
+tier divided by 1,000,000 as `taker_fee`. Distinct pool identifiers let same‑token pools coexist in
+the cache and on the message bus.
 
 Uniswap V3 and compatible concentrated-liquidity pools also use:
 
@@ -58,7 +65,7 @@ Uniswap V3 and compatible concentrated-liquidity pools also use:
 ## Configuration
 
 | Option                            | Default            | Description                                            |
-|-----------------------------------|--------------------|--------------------------------------------------------|
+| --------------------------------- | ------------------ | ------------------------------------------------------ |
 | `chain`                           | Required           | Target `Chain`, such as Ethereum or Arbitrum.          |
 | `dex_ids`                         | `[]`               | DEX integrations to register and sync.                 |
 | `http_rpc_url`                    | Required           | HTTP RPC endpoint for contract reads and Multicall.    |

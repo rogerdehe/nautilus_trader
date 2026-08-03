@@ -9,7 +9,7 @@ when a fill creates a new position (see [From fill to position](index.md#from-fi
 the three events. The fields that distinguish `PositionOpened`:
 
 | Field          | Python type    | Description                                    |
-|----------------|----------------|------------------------------------------------|
+| -------------- | -------------- | ---------------------------------------------- |
 | `entry`        | `OrderSide`    | The entry order side that opened the position. |
 | `side`         | `PositionSide` | The current position side (`LONG` or `SHORT`). |
 | `quantity`     | `Quantity`     | The current open quantity.                     |
@@ -25,8 +25,7 @@ Reading the event in a strategy handler:
 ```python
 def on_position_opened(self, event: PositionOpened) -> None:
     self.log.info(
-        f"Opened {event.side} {event.quantity} {event.instrument_id} "
-        f"@ {event.avg_px_open}",
+        f"Opened {event.side} {event.quantity} {event.instrument_id} @ {event.avg_px_open}",
     )
 ```
 

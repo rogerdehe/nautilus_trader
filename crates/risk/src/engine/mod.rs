@@ -32,7 +32,7 @@ use nautilus_common::{
     },
     msgbus,
     msgbus::{MessagingSwitchboard, TypedHandler, TypedIntoHandler, get_message_bus},
-    runner::try_get_trading_cmd_sender,
+    runner::{TradingCommandMessage, try_get_trading_cmd_sender},
     throttler::{RateLimit, Throttler},
 };
 use nautilus_core::{UUID4, WeakCell};
@@ -149,12 +149,15 @@ impl RiskEngine {
         // event-loop iteration, preventing a synchronous `deny_order()` from
         // dispatching an `OrderDenied` back into a strategy that still holds a
         // mutable borrow - which would otherwise panic on `RefCell` re-entrancy.
-        // In backtest/test mode (no sender), falls back to the direct endpoint.
+        // If no sender is installed, the queued endpoint falls back to direct dispatch.
         msgbus::register_trading_command_endpoint(
             MessagingSwitchboard::risk_engine_queue_execute(),
             TypedIntoHandler::from(move |cmd: TradingCommand| {
                 if let Some(sender) = try_get_trading_cmd_sender() {
-                    sender.execute(cmd);
+                    sender.execute(TradingCommandMessage::new(
+                        MessagingSwitchboard::risk_engine_execute(),
+                        cmd,
+                    ));
                 } else {
                     let endpoint = MessagingSwitchboard::risk_engine_execute();
                     msgbus::send_trading_command(endpoint, cmd);
@@ -176,8 +179,13 @@ impl RiskEngine {
         msgbus::subscribe_order_events(
             "events.order.*".into(),
             TypedHandler::from(move |event: &OrderEventAny| {
-                if let Some(rc) = weak_order_events.upgrade() {
-                    rc.borrow_mut().process(event.clone());
+                // Risk-generated events can publish while `execute` still owns the engine,
+                // and processing is observational, so skipping reentrant events is safe.
+                // TODO: Revisit this if order-event processing gains stateful behavior
+                if let Some(rc) = weak_order_events.upgrade()
+                    && let Ok(mut engine) = rc.try_borrow_mut()
+                {
+                    engine.process(event.clone());
                 }
             }),
             Some(10),
@@ -376,7 +384,7 @@ impl RiskEngine {
             timestamp,
             false,
             order.venue_order_id(),
-            None,
+            order.account_id(),
         ))
     }
 
@@ -1610,8 +1618,8 @@ impl RiskEngine {
 
                 // Check if order reduces an existing position
                 let is_position_reducing = if order.is_buy() {
-                    let reducing = order.is_reduce_only()
-                        || (cum_buy_qty_raw + effective_quantity.raw) <= available_short_qty_raw;
+                    let reducing =
+                        (cum_buy_qty_raw + effective_quantity.raw) <= available_short_qty_raw;
                     cum_buy_qty_raw += effective_quantity.raw;
                     reducing
                 } else if order.is_sell() {
@@ -1773,7 +1781,10 @@ impl RiskEngine {
                         // Use base-currency free balance for sell checks
                         let base_free = match &account {
                             AccountAny::Margin(_) => None,
-                            AccountAny::Cash(cash) => cash.balance_free(Some(base_currency)),
+                            AccountAny::Cash(cash) => Some(
+                                cash.balance_free(Some(base_currency))
+                                    .unwrap_or_else(|| Money::zero(base_currency)),
+                            ),
                             AccountAny::Betting(betting) => {
                                 betting.balance_free(Some(base_currency))
                             }

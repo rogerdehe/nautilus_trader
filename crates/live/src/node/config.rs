@@ -32,7 +32,9 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4,
-    datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
+    datetime::{
+        NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, checked_mins_to_nanos, secs_to_nanos,
+    },
 };
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
@@ -58,6 +60,15 @@ use crate::execution::manager::ExecutionManagerConfig;
 const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
 const RUST_RUNTIME_UNSUPPORTED: &str = "not supported by the Rust live runtime yet";
 const RATE_LIMIT_FORMAT: &str = "expected 'limit/HH:MM:SS'";
+
+pub(crate) fn validate_live_environment(environment: Environment) -> anyhow::Result<()> {
+    match environment {
+        Environment::Sandbox | Environment::Live => Ok(()),
+        Environment::Backtest => {
+            anyhow::bail!("LiveNode cannot be used with Backtest environment")
+        }
+    }
+}
 
 /// Configuration for live data engines.
 #[cfg_attr(
@@ -337,6 +348,20 @@ pub(crate) fn validate_non_negative_finite_f64(field: &str, value: f64) -> Confi
     )
 }
 
+pub(crate) fn validate_positive_interval_secs(field: &str, value: f64) -> ConfigResult<()> {
+    check_range(
+        field,
+        value.is_finite() && value > 0.0,
+        format!("{value} (must be a positive finite number)"),
+    )?;
+    let nanos = secs_to_nanos(value).map_err(|e| ConfigError::range(field, e.to_string()))?;
+    check_range(
+        field,
+        nanos > 0,
+        format!("{value} (must be at least one nanosecond)"),
+    )
+}
+
 #[cfg(feature = "python")]
 pub(crate) fn duration_from_secs_f64(field: &str, value: f64) -> ConfigResult<Duration> {
     check_range(
@@ -499,6 +524,8 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
             snapshot_orders: config.snapshot_orders,
             snapshot_positions: config.snapshot_positions,
             snapshot_positions_interval_secs: config.snapshot_positions_interval_secs,
+            // Live must carry replay state so prior-cycle void corrections still resolve
+            carry_replay_events_on_reopen: true,
             allow_overfills: config.allow_overfills,
             filter_unclaimed_external_orders: config.filter_unclaimed_external_orders,
             external_clients: config.external_clients,
@@ -721,10 +748,10 @@ pub struct LiveNodeConfig {
     /// The trader ID for the node.
     #[builder(default = TraderId::from("TRADER-001"))]
     pub trader_id: TraderId,
-    /// If trading strategy state should be loaded from the database on start.
+    /// If actor and strategy state should be loaded from the database on start.
     #[builder(default)]
     pub load_state: bool,
-    /// If trading strategy state should be saved to the database on stop.
+    /// If actor and strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
     /// If the system should request shutdown when an error log is emitted.
@@ -740,7 +767,7 @@ pub struct LiveNodeConfig {
     /// The timeout for all clients to connect and initialize.
     #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
-    /// The timeout for execution state to reconcile.
+    /// The timeout for startup reconciliation and each continuous report-collection task.
     #[builder(default = Duration::from_secs(30))]
     pub timeout_reconciliation: Duration,
     /// The timeout for portfolio to initialize margins and unrealized pnls.
@@ -933,7 +960,7 @@ impl LiveRiskEngineConfig {
 }
 
 impl LiveExecEngineConfig {
-    fn validate_runtime_support(&self) -> ConfigResult<()> {
+    pub(crate) fn validate_runtime_support(&self) -> ConfigResult<()> {
         let mut collector = ConfigErrorCollector::new();
 
         // `Duration::from_secs_f64` panics on negative, NaN, or infinite input, and the
@@ -943,6 +970,56 @@ impl LiveExecEngineConfig {
             "LiveExecEngineConfig.reconciliation_startup_delay_secs",
             self.reconciliation_startup_delay_secs,
         ));
+
+        for (field, value) in [
+            (
+                "LiveExecEngineConfig.snapshot_positions_interval_secs",
+                self.snapshot_positions_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.open_check_interval_secs",
+                self.open_check_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.position_check_interval_secs",
+                self.position_check_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.own_books_audit_interval_secs",
+                self.own_books_audit_interval_secs,
+            ),
+        ] {
+            if let Some(value) = value {
+                collector.collect(validate_positive_interval_secs(field, value));
+            }
+        }
+
+        for (field, value) in [
+            (
+                "LiveExecEngineConfig.open_check_lookback_mins",
+                self.open_check_lookback_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_orders_interval_mins",
+                self.purge_closed_orders_interval_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_positions_interval_mins",
+                self.purge_closed_positions_interval_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_account_events_interval_mins",
+                self.purge_account_events_interval_mins,
+            ),
+        ] {
+            if let Some(mins) = value {
+                collector.collect(check_range(
+                    field,
+                    checked_mins_to_nanos(u64::from(mins)).is_some(),
+                    format!("{mins} minutes (must fit in `u64` nanoseconds)"),
+                ));
+            }
+        }
 
         if let Some(instrument_ids) = &self.reconciliation_instrument_ids {
             collector.collect(validate_instrument_id_strings(
@@ -1312,6 +1389,8 @@ mod tests {
         assert_eq!(converted.purge_closed_positions_buffer_mins, Some(2));
         assert_eq!(converted.purge_account_events_interval_mins, Some(15));
         assert_eq!(converted.purge_account_events_lookback_mins, Some(3));
+        // Pinned on for live regardless of the `ExecutionEngineConfig` default
+        assert!(converted.carry_replay_events_on_reopen);
     }
 
     #[rstest]
@@ -1450,6 +1529,45 @@ mod tests {
     }
 
     #[rstest]
+    fn test_validate_runtime_support_rejects_overflowing_minute_fields() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                open_check_lookback_mins: Some(u32::MAX),
+                purge_closed_orders_interval_mins: Some(u32::MAX),
+                purge_closed_positions_interval_mins: Some(u32::MAX),
+                purge_account_events_interval_mins: Some(u32::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::Multiple {
+                errors: vec![
+                    ConfigError::range(
+                        "LiveExecEngineConfig.open_check_lookback_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_closed_orders_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_closed_positions_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_account_events_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                ],
+            }
+        );
+    }
+
+    #[rstest]
     fn test_validate_runtime_support_rejects_invalid_rate_limit() {
         let config = LiveNodeConfig {
             risk_engine: LiveRiskEngineConfig {
@@ -1524,6 +1642,69 @@ mod tests {
 
         let error = config.validate_runtime_support().unwrap_err().to_string();
         assert!(error.contains("reconciliation_startup_delay_secs"));
+    }
+
+    #[rstest]
+    #[case(0.0)]
+    #[case(0.5e-9)]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(f64::NEG_INFINITY)]
+    #[case(f64::MAX)]
+    fn test_validate_runtime_support_rejects_invalid_exec_intervals(#[case] value: f64) {
+        let configs = [
+            (
+                "LiveExecEngineConfig.snapshot_positions_interval_secs",
+                LiveExecEngineConfig {
+                    snapshot_positions_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.open_check_interval_secs",
+                LiveExecEngineConfig {
+                    open_check_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.position_check_interval_secs",
+                LiveExecEngineConfig {
+                    position_check_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.own_books_audit_interval_secs",
+                LiveExecEngineConfig {
+                    own_books_audit_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (expected_field, config) in configs {
+            let error = config.validate_runtime_support().unwrap_err();
+
+            assert!(matches!(
+                error,
+                ConfigError::Range { field, .. } if field == expected_field
+            ));
+        }
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_accepts_valid_exec_intervals() {
+        let config = LiveExecEngineConfig {
+            snapshot_positions_interval_secs: Some(1.25),
+            open_check_interval_secs: Some(2.5),
+            position_check_interval_secs: Some(3.75),
+            own_books_audit_interval_secs: Some(4.5),
+            ..Default::default()
+        };
+
+        assert!(config.validate_runtime_support().is_ok());
     }
 
     #[cfg(feature = "python")]

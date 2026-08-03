@@ -21,6 +21,7 @@
 //! endpoints via its registered execution clients.
 
 pub mod config;
+pub mod position;
 pub mod stubs;
 
 use std::{
@@ -36,7 +37,7 @@ use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
-    cache::{Cache, CacheSnapshotRef, PositionRef},
+    cache::{Cache, PositionRef},
     clients::ExecutionClient,
     clock::Clock,
     enums::LogColor,
@@ -54,7 +55,10 @@ use nautilus_common::{
         self, MessagingSwitchboard, TypedHandler, TypedIntoHandler, get_message_bus,
         switchboard::{self},
     },
-    runner::try_get_trading_cmd_sender,
+    runner::{
+        TradingCommandMessage, capture_trading_cmd, trading_cmd_is_dispatching,
+        try_get_trading_cmd_sender,
+    },
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
@@ -83,6 +87,8 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
 };
+use position::CorrectedPosition;
+pub use position::{PositionStateSnapshot, SnapshotAnchorer};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -98,20 +104,6 @@ const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
-
-/// Position state snapshot published to the `snapshots.position.{position_id}` topic.
-#[derive(Debug, Clone)]
-pub struct PositionStateSnapshot {
-    /// The position state at the time of the snapshot.
-    pub position: Position,
-    /// The unrealized PnL for the position, when a current quote is available.
-    pub unrealized_pnl: Option<Money>,
-    /// UNIX timestamp (nanoseconds) when the snapshot was taken.
-    pub ts_snapshot: UnixNanos,
-}
-
-/// Callback that anchors cache snapshot metadata in an external store.
-pub type SnapshotAnchorer = Rc<dyn Fn(CacheSnapshotRef) -> anyhow::Result<()>>;
 
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
@@ -192,14 +184,16 @@ impl ExecutionEngine {
         );
 
         // Queued endpoint for deferred command execution (re-entrancy safe),
-        // falls back to direct endpoint if no sender is initialized (e.g., backtest/test).
+        // with direct dispatch when no sender is installed.
         msgbus::register_trading_command_endpoint(
             MessagingSwitchboard::exec_engine_queue_execute(),
             TypedIntoHandler::from(move |cmd: TradingCommand| {
-                if let Some(sender) = try_get_trading_cmd_sender() {
-                    sender.execute(cmd);
+                let endpoint = MessagingSwitchboard::exec_engine_execute();
+                if trading_cmd_is_dispatching() {
+                    capture_trading_cmd(TradingCommandMessage::new(endpoint, cmd));
+                } else if let Some(sender) = try_get_trading_cmd_sender() {
+                    sender.execute(TradingCommandMessage::new(endpoint, cmd));
                 } else {
-                    let endpoint = MessagingSwitchboard::exec_engine_execute();
                     msgbus::send_trading_command(endpoint, cmd);
                 }
             }),
@@ -615,6 +609,10 @@ impl ExecutionEngine {
     /// Returns an error if no client is registered with the given ID.
     pub fn deregister_client(&mut self, client_id: ClientId) -> anyhow::Result<()> {
         if self.clients.shift_remove(&client_id).is_some() {
+            if self.default_client_id == Some(client_id) {
+                self.default_client_id = None;
+            }
+
             // Remove from routing map if present
             self.routing_map
                 .retain(|_, mapped_id| mapped_id != &client_id);
@@ -1124,7 +1122,7 @@ impl ExecutionEngine {
         let trader_id = get_message_bus().borrow().trader_id;
         let ts_now = self.clock.borrow().timestamp_ns();
 
-        let initialized = OrderInitialized::new(
+        let initialized = match OrderInitialized::new_checked(
             trader_id,
             strategy_id,
             report.instrument_id,
@@ -1159,7 +1157,13 @@ impl ExecutionEngine {
             None, // exec_algorithm_params
             None, // exec_spawn_id
             None, // tags
-        );
+        ) {
+            Ok(initialized) => initialized,
+            Err(e) => {
+                log::error!("Failed to create external order from report: {e}");
+                return None;
+            }
+        };
 
         self.materialize_external_order(
             initialized,
@@ -1300,13 +1304,14 @@ impl ExecutionEngine {
 
         {
             let mut cache = self.cache.borrow_mut();
-            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
-                log::error!("Failed to add external order to cache: {e}");
+            if let Err(e) = cache.add_venue_order_id(&client_order_id, &venue_order_id, false) {
+                log::warn!("Failed to claim venue order ID for external order: {e}");
                 return None;
             }
 
-            if let Err(e) = cache.add_venue_order_id(&client_order_id, &venue_order_id, false) {
-                log::warn!("Failed to add venue order ID index: {e}");
+            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
+                log::error!("Failed to add external order to cache: {e}");
+                return None;
             }
         }
 
@@ -2531,7 +2536,9 @@ impl ExecutionEngine {
 
                 if validation.is_ok() {
                     let event = OrderEventAny::Filled(fill.clone());
-                    let Some(order) = self.update_cached_order(client_order_id, &event) else {
+                    let Some(order) =
+                        self.update_cached_order(client_order_id, &event, apply_position)
+                    else {
                         return;
                     };
 
@@ -2603,10 +2610,28 @@ impl ExecutionEngine {
 
                 let mut position_events = Vec::new();
 
-                for (position, corrected_qty) in corrected_positions {
+                for CorrectedPosition {
+                    position,
+                    corrected_qty,
+                    absorbed_prior_cycles,
+                    closed_cycles_pnl,
+                } in corrected_positions
+                {
                     if let Err(e) = self.cache.borrow_mut().update_position(&position) {
                         log::error!("Cannot apply fill void to position {}: {e}", position.id);
                         return;
+                    }
+
+                    if absorbed_prior_cycles {
+                        log::info!(
+                            "Settling archived NETTING cycles rebuilt by fill void {} for position {}: realized={closed_cycles_pnl:?}",
+                            voided.trade_id,
+                            position.id,
+                        );
+
+                        self.cache
+                            .borrow_mut()
+                            .settle_position_snapshots(&position, closed_cycles_pnl);
                     }
 
                     if self.config.snapshot_positions {
@@ -2620,7 +2645,10 @@ impl ExecutionEngine {
                     ));
                 }
 
-                if self.update_cached_order(client_order_id, &event).is_none() {
+                if self
+                    .update_cached_order(client_order_id, &event, true)
+                    .is_none()
+                {
                     return;
                 }
 
@@ -2632,7 +2660,10 @@ impl ExecutionEngine {
                 self.publish_position_events(position_events);
             }
             _ => {
-                if self.update_cached_order(client_order_id, &event).is_some() {
+                if self
+                    .update_cached_order(client_order_id, &event, true)
+                    .is_some()
+                {
                     self.publish_order_event(&event);
                 }
             }
@@ -2662,20 +2693,20 @@ impl ExecutionEngine {
         let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id);
 
         let event = OrderEventAny::Filled(fill.clone());
-        let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-        msgbus::send_order_event(portfolio_endpoint, event.clone());
 
-        let position_events = if duplicate_position_fill {
+        if duplicate_position_fill {
             log::warn!(
-                "Duplicate leg fill: {} trade_id={} already applied to position {}, skipping position update",
+                "Duplicate leg fill: {} trade_id={} already applied to position {}, skipping",
                 fill.client_order_id,
                 fill.trade_id,
                 position_id
             );
-            Vec::new()
-        } else {
-            self.handle_position_update(&instrument, fill, oms_type)
-        };
+            return;
+        }
+
+        let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
+        msgbus::send_order_event(portfolio_endpoint, event.clone());
+        let position_events = self.handle_position_update(&instrument, fill, oms_type);
         self.publish_order_event(&event);
         self.publish_position_events(position_events);
     }
@@ -3005,6 +3036,7 @@ impl ExecutionEngine {
         &self,
         client_order_id: ClientOrderId,
         event: &OrderEventAny,
+        send_portfolio_update: bool,
     ) -> Option<OrderAny> {
         let result = { self.cache.borrow_mut().update_order(event) };
 
@@ -3109,7 +3141,9 @@ impl ExecutionEngine {
             self.create_order_state_snapshot(&order);
         }
 
-        self.send_order_update_to_portfolio(event);
+        if send_portfolio_update {
+            self.send_order_update_to_portfolio(event);
+        }
 
         Some(order)
     }
@@ -3316,7 +3350,7 @@ impl ExecutionEngine {
         &self,
         order: &OrderAny,
         event: &OrderFillVoided,
-    ) -> anyhow::Result<Vec<(Position, Quantity)>> {
+    ) -> anyhow::Result<Vec<CorrectedPosition>> {
         let source_event_id = order
             .events()
             .into_iter()
@@ -3456,8 +3490,35 @@ impl ExecutionEngine {
             let corrected_qty = previous.map_or(voided_qty, |(prior_qty, _)| {
                 voided_qty.saturating_sub(prior_qty)
             });
-            position.apply_fill_void(event.clone(), voided_qty, commission_voided)?;
-            corrected_positions.push((position, corrected_qty));
+
+            // `events` holds the fills since the position was last flat, because `apply_fill`
+            // clears it when reopening from flat. A NETTING flip splits one fill across the
+            // closing and reopening cycles under the same trade, so compare quantities rather
+            // than presence: the correction reaches an earlier cycle once it exceeds what the
+            // current cycle originally held. Earlier corrections have already shrunk the
+            // fragments in `events` while `voided_qty` stays cumulative, so add back what this
+            // position already voided. Read this before `apply_fill_void`, whose rebuild
+            // re-derives `events` and can move that boundary.
+            let previously_voided = previous
+                .map_or(Quantity::zero(position.size_precision), |(prior_qty, _)| {
+                    prior_qty
+                });
+            let current_cycle_qty = position
+                .events
+                .iter()
+                .filter(|fill| {
+                    fill.client_order_id == event.client_order_id && fill.trade_id == event.trade_id
+                })
+                .fold(previously_voided, |total, fill| total + fill.last_qty);
+            let absorbed_prior_cycles = voided_qty > current_cycle_qty;
+            let closed_cycles_pnl =
+                position.apply_fill_void(event.clone(), voided_qty, commission_voided)?;
+            corrected_positions.push(CorrectedPosition {
+                position,
+                corrected_qty,
+                absorbed_prior_cycles,
+                closed_cycles_pnl,
+            });
         }
         Ok(corrected_positions)
     }
@@ -3640,10 +3701,15 @@ impl ExecutionEngine {
             self.reopen_position(position, oms_type)?;
         }
 
-        let prior_position = position.cloned().or_else(|| {
-            fill.position_id
-                .and_then(|position_id| self.cache.borrow().position_owned(&position_id))
-        });
+        // The prior-position clone exists only to carry replay state across the reopen
+        let prior_position = if self.config.carry_replay_events_on_reopen {
+            position.cloned().or_else(|| {
+                fill.position_id
+                    .and_then(|position_id| self.cache.borrow().position_owned(&position_id))
+            })
+        } else {
+            None
+        };
         let mut position = Position::new(instrument, fill.clone());
         if let Some(prior) = prior_position
             && prior.id == position.id
@@ -3666,11 +3732,11 @@ impl ExecutionEngine {
     }
 
     fn is_duplicate_closed_fill(position: &Position, fill: &OrderFilled) -> bool {
-        position.events.iter().any(|event| {
-            event.trade_id == fill.trade_id
-                && event.order_side == fill.order_side
-                && event.last_px == fill.last_px
-                && event.last_qty == fill.last_qty
+        position.replay_events.iter().any(|event| {
+            matches!(
+                event,
+                PositionReplayEvent::Filled(replayed) if replayed.trade_id == fill.trade_id
+            )
         })
     }
 
@@ -3683,8 +3749,7 @@ impl ExecutionEngine {
                 );
             }
             // Snapshot closed position if reopening (NETTING mode)
-            let snapshot_ref = self.cache.borrow_mut().snapshot_position(position)?;
-            self.anchor_snapshot(snapshot_ref);
+            self.snapshot_position(position)?;
         } else {
             // HEDGING mode
             log::warn!(
@@ -3695,14 +3760,25 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    fn anchor_snapshot(&self, snapshot_ref: CacheSnapshotRef) {
+    /// Archives the closed `position` and anchors the frame when an anchorer is installed.
+    ///
+    /// An installed anchorer needs the encoded frame, so this takes the eager path. Without one
+    /// the cache defers the encode unless a backing database has to persist the frame.
+    fn snapshot_position(&self, position: &Position) -> anyhow::Result<()> {
+        let mut cache = self.cache.borrow_mut();
+
         let Some(anchorer) = &self.snapshot_anchorer else {
-            return;
+            return cache.snapshot_position(position);
         };
+
+        let snapshot_ref = cache.snapshot_position_encoded(position)?;
+        drop(cache);
 
         if let Err(e) = anchorer(snapshot_ref) {
             log::warn!("Failed to record cache snapshot anchor: {e}");
         }
+
+        Ok(())
     }
 
     fn update_position(
@@ -3841,11 +3917,10 @@ impl ExecutionEngine {
             }
 
             // Snapshot closed position before reusing ID (NETTING mode)
-            if oms_type == OmsType::Netting {
-                match self.cache.borrow_mut().snapshot_position(position) {
-                    Ok(snapshot_ref) => self.anchor_snapshot(snapshot_ref),
-                    Err(e) => log::warn!("Failed to snapshot position during flip: {e:?}"),
-                }
+            if oms_type == OmsType::Netting
+                && let Err(e) = self.snapshot_position(position)
+            {
+                log::warn!("Failed to snapshot position during flip: {e:?}");
             }
         }
 
@@ -3971,11 +4046,13 @@ impl ExecutionEngine {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::clock::TestClock;
     use nautilus_model::{
-        enums::{LiquiditySide, OrderSide, PositionSideSpecified},
+        enums::{LiquiditySide, OrderSide, OrderType, PositionSideSpecified},
         events::order::spec::OrderFilledSpec,
         identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
+        orders::builder::OrderTestBuilder,
         types::Price,
     };
     use rstest::*;
@@ -4091,6 +4168,52 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[rstest]
+    fn materialize_external_order_rejects_venue_id_owned_by_another_order() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let venue_order_id = VenueOrderId::from("V-SHARED");
+        let owner_id = ClientOrderId::from("O-OWNER");
+        cache
+            .borrow_mut()
+            .add_venue_order_id(&owner_id, &venue_order_id, false)
+            .unwrap();
+        let engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::clone(&cache),
+            None,
+        );
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let claimant_id = ClientOrderId::from("O-CLAIMANT");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(claimant_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let OrderEventAny::Initialized(initialized) = order.last_event().clone() else {
+            panic!("Expected initialized order");
+        };
+
+        let result = engine.materialize_external_order(
+            initialized,
+            claimant_id,
+            venue_order_id,
+            instrument.id(),
+            order.strategy_id(),
+            UnixNanos::default(),
+            None,
+        );
+
+        assert!(result.is_none());
+        assert!(!cache.borrow().order_exists(&claimant_id));
+        assert_eq!(
+            cache.borrow().client_order_id(&venue_order_id),
+            Some(&owner_id)
+        );
+        assert_eq!(cache.borrow().venue_order_id(&claimant_id), None);
     }
 
     fn position_for_account(

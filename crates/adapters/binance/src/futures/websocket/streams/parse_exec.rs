@@ -38,13 +38,13 @@ use super::messages::{
 use crate::{
     common::{
         consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        encoder::decode_broker_id,
+        encoder::decode_client_order_id,
         enums::{
             BinanceAlgoStatus, BinanceFuturesOrderType, BinanceOrderStatus, BinanceSide,
             BinanceTimeInForce, BinanceWorkingType,
         },
         parse::{
-            parse_required_decimal, parse_required_price_at_precision,
+            parse_millis_or_init, parse_required_decimal, parse_required_price_at_precision,
             parse_required_quantity_at_precision,
         },
     },
@@ -66,12 +66,9 @@ pub fn parse_futures_order_update_to_order_status(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let order = &msg.order;
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event = parse_millis_or_init(msg.event_time, "Futures order update event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_order_client_id(order)?;
     let venue_order_id = VenueOrderId::new(order.order_id.to_string());
 
     let order_side = parse_side(order.side);
@@ -124,8 +121,9 @@ pub fn parse_futures_order_update_to_order_status(
     report.post_only = order.order_type == BinanceFuturesOrderType::Limit
         && order.time_in_force == BinanceTimeInForce::Gtx;
 
-    if let Some(expire_time) = parse_good_till_date(order.good_till_date)? {
-        report.expire_time = Some(expire_time);
+    match parse_good_till_date(order.good_till_date) {
+        Ok(expire_time) => report.expire_time = expire_time,
+        Err(e) => log::warn!("{e}; omitting Futures order expiry"),
     }
 
     if order_type_has_trigger_price(order_type)
@@ -227,12 +225,9 @@ pub fn parse_futures_order_update_to_fill(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let order = &msg.order;
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event = parse_millis_or_init(msg.event_time, "Futures fill event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_order_client_id(order)?;
     let venue_order_id = VenueOrderId::new(order.order_id.to_string());
     let trade_id = TradeId::new(order.trade_id.to_string());
 
@@ -288,7 +283,8 @@ pub fn parse_futures_order_update_to_fill(
 ///
 /// # Errors
 ///
-/// Returns an error if report quantity, limit price, or trigger price parsing fails.
+/// Returns an error if client order ID, report quantity, limit price, or trigger price parsing
+/// fails.
 pub fn parse_futures_algo_update_to_order_status(
     algo_data: &AlgoOrderUpdateData,
     event_time: i64,
@@ -298,12 +294,10 @@ pub fn parse_futures_algo_update_to_order_status(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<OrderStatusReport>> {
-    let ts_event = UnixNanos::from_millis(event_time as u64);
+    let ts_event =
+        parse_millis_or_init(event_time, "Futures algo order update event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &algo_data.client_algo_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_algo_client_id(algo_data)?;
 
     let venue_order_id = algo_data
         .actual_order_id
@@ -361,8 +355,9 @@ pub fn parse_futures_algo_update_to_order_status(
         report.trigger_type = Some(parse_working_type(algo_data.working_type));
     }
 
-    if let Some(expire_time) = parse_good_till_date(algo_data.good_till_date)? {
-        report.expire_time = Some(expire_time);
+    match parse_good_till_date(algo_data.good_till_date) {
+        Ok(expire_time) => report.expire_time = expire_time,
+        Err(e) => log::warn!("{e}; omitting Futures algo order expiry"),
     }
 
     Ok(Some(report))
@@ -375,7 +370,8 @@ pub fn parse_futures_account_update(
     bnfcr_currency: Currency,
     ts_init: UnixNanos,
 ) -> Option<AccountState> {
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event =
+        parse_millis_or_init(msg.event_time, "Futures account update event time", ts_init);
 
     let balances: Vec<AccountBalance> = msg
         .account
@@ -410,19 +406,21 @@ pub fn parse_futures_account_update(
 }
 
 /// Returns the decoded client order ID from an [`OrderUpdateData`].
-pub fn decode_order_client_id(order: &OrderUpdateData) -> ClientOrderId {
-    ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ))
+///
+/// # Errors
+///
+/// Returns an error if the encoded client order ID is malformed or invalid.
+pub fn decode_order_client_id(order: &OrderUpdateData) -> anyhow::Result<ClientOrderId> {
+    decode_client_order_id(&order.client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)
 }
 
 /// Returns the decoded client order ID from an [`AlgoOrderUpdateData`].
-pub fn decode_algo_client_id(algo: &AlgoOrderUpdateData) -> ClientOrderId {
-    ClientOrderId::new(decode_broker_id(
-        &algo.client_algo_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ))
+///
+/// # Errors
+///
+/// Returns an error if the encoded client order ID is malformed or invalid.
+pub fn decode_algo_client_id(algo: &AlgoOrderUpdateData) -> anyhow::Result<ClientOrderId> {
+    decode_client_order_id(&algo.client_algo_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)
 }
 
 fn parse_optional_positive_price_at_precision(raw: &str, precision: u8) -> Option<Price> {
@@ -713,6 +711,32 @@ mod tests {
         .unwrap();
         assert_eq!(limit_report.order_type, OrderType::Limit);
         assert_eq!(limit_report.price, Some(Price::from("7100.50")));
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::overflow(i64::MAX)]
+    fn test_parse_order_update_to_order_status_falls_back_for_invalid_timestamp(
+        #[case] event_time: i64,
+    ) {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.event_time = event_time;
+
+        let ts_init = UnixNanos::from(1);
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.ts_accepted, ts_init);
+        assert_eq!(report.ts_last, ts_init);
+        assert_eq!(report.ts_init, ts_init);
     }
 
     #[rstest]
@@ -1198,9 +1222,26 @@ mod tests {
         let original = ClientOrderId::from("O-20200101-000000-000-000-1");
         msg.order.client_order_id = encode_broker_id(&original, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
-        let decoded = decode_order_client_id(&msg.order);
+        let decoded = decode_order_client_id(&msg.order).unwrap();
 
         assert_eq!(decoded, original);
+    }
+
+    #[rstest]
+    #[case::empty("", "invalid Binance client order ID ''")]
+    #[case::whitespace("   ", "invalid Binance client order ID '   '")]
+    #[case::non_ascii("client-é", "invalid Binance client order ID 'client-é'")]
+    #[case::malformed_prefixed("x-aHRE4BCj-R", "missing raw broker client order ID payload")]
+    fn test_decode_order_client_id_rejects_invalid_input(
+        #[case] client_order_id: &str,
+        #[case] expected: &str,
+    ) {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.client_order_id = client_order_id.to_string();
+
+        let result = decode_order_client_id(&msg.order);
+
+        assert_eq!(result.unwrap_err().to_string(), expected);
     }
 
     #[rstest]
@@ -1211,9 +1252,23 @@ mod tests {
         msg.algo_order.client_algo_id =
             encode_broker_id(&original, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
-        let decoded = decode_algo_client_id(&msg.algo_order);
+        let decoded = decode_algo_client_id(&msg.algo_order).unwrap();
 
         assert_eq!(decoded, original);
+    }
+
+    #[rstest]
+    fn test_decode_algo_client_id_rejects_malformed_prefixed_input() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.client_algo_id = "x-aHRE4BCj-Tinvalid".to_string();
+
+        let result = decode_algo_client_id(&msg.algo_order);
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid O-format broker client order ID payload length"
+        );
     }
 
     #[rstest]

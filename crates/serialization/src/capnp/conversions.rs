@@ -46,7 +46,10 @@ use nautilus_model::{
         AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
         OrderListId, PositionId, StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
-    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
+    types::{
+        AccountBalance, Currency, MarginBalance, Money, Price, Quantity, money::MoneyRaw,
+        price::PriceRaw, quantity::QuantityRaw,
+    },
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -54,8 +57,9 @@ use uuid::Uuid;
 
 use super::{FromCapnp, ToCapnp};
 use crate::{
-    base_capnp, enums_capnp, identifiers_capnp, market_capnp, order_capnp, position_capnp,
-    types_capnp,
+    base_capnp, enums_capnp, identifiers_capnp, market_capnp,
+    numeric::{raw_to_wire, wire_to_raw},
+    order_capnp, position_capnp, types_capnp,
 };
 
 trait CapnpWriteExt<'a, T>
@@ -442,9 +446,8 @@ impl<'a> FromCapnp<'a> for InstrumentId {
 impl<'a> ToCapnp<'a> for Price {
     type Builder = types_capnp::price::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
-        let raw_i128: i128 = self.raw.into();
+        let raw_i128: i128 = raw_to_wire(self.raw);
         let lo = raw_i128 as u64;
         let hi = (raw_i128 >> 64) as u64;
 
@@ -470,25 +473,19 @@ impl<'a> FromCapnp<'a> for Price {
         // to all upper bits when widened to i128, preserving two's complement.
         let raw_i128 = ((hi as i64 as i128) << 64) | (lo as i128);
 
-        #[cfg(not(feature = "high-precision"))]
-        let raw = i64::try_from(raw_i128).map_err(|_| -> Box<dyn Error> {
+        let raw: PriceRaw = wire_to_raw(raw_i128).ok_or_else(|| -> Box<dyn Error> {
             "Price value overflows i64 in standard precision mode".into()
         })?;
 
-        #[cfg(feature = "high-precision")]
-        let raw = raw_i128;
-
-        #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
-        Ok(Self::from_raw(raw.into(), precision))
+        Ok(Self::from_raw_checked(raw, precision)?)
     }
 }
 
 impl<'a> ToCapnp<'a> for Quantity {
     type Builder = types_capnp::quantity::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
-        let raw_u128: u128 = self.raw.into();
+        let raw_u128: u128 = raw_to_wire(self.raw);
         let lo = raw_u128 as u64;
         let hi = (raw_u128 >> 64) as u64;
 
@@ -512,16 +509,11 @@ impl<'a> FromCapnp<'a> for Quantity {
         // Reconstruct u128 from two u64 halves (unsigned, no sign extension needed)
         let raw_u128 = ((hi as u128) << 64) | (lo as u128);
 
-        #[cfg(not(feature = "high-precision"))]
-        let raw = u64::try_from(raw_u128).map_err(|_| -> Box<dyn Error> {
+        let raw: QuantityRaw = wire_to_raw(raw_u128).ok_or_else(|| -> Box<dyn Error> {
             "Quantity value overflows u64 in standard precision mode".into()
         })?;
 
-        #[cfg(feature = "high-precision")]
-        let raw = raw_u128;
-
-        #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
-        Ok(Self::from_raw(raw.into(), precision))
+        Ok(Self::from_raw_checked(raw, precision)?)
     }
 }
 
@@ -1216,11 +1208,10 @@ impl<'a> FromCapnp<'a> for Currency {
 impl<'a> ToCapnp<'a> for Money {
     type Builder = types_capnp::money::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
         let mut raw_builder = builder.reborrow().init_raw();
 
-        let raw_i128: i128 = self.raw.into();
+        let raw_i128: i128 = raw_to_wire(self.raw);
         raw_builder.set_lo(raw_i128 as u64);
         raw_builder.set_hi((raw_i128 >> 64) as u64);
 
@@ -1243,18 +1234,11 @@ impl<'a> FromCapnp<'a> for Money {
         let currency_reader = reader.get_currency()?;
         let currency = Currency::from_capnp(currency_reader)?;
 
-        #[cfg(not(feature = "high-precision"))]
-        {
-            let raw = i64::try_from(raw_i128).map_err(|_| -> Box<dyn Error> {
-                "Money value overflows i64 in standard precision mode".into()
-            })?;
-            Ok(Self::from_raw(raw.into(), currency))
-        }
+        let raw: MoneyRaw = wire_to_raw(raw_i128).ok_or_else(|| -> Box<dyn Error> {
+            "Money value overflows i64 in standard precision mode".into()
+        })?;
 
-        #[cfg(feature = "high-precision")]
-        {
-            Ok(Self::from_raw(raw_i128, currency))
-        }
+        Ok(Self::from_raw(raw, currency))
     }
 }
 
@@ -2018,11 +2002,7 @@ impl<'a> ToCapnp<'a> for BarSpecification {
     type Builder = market_capnp::bar_spec::Builder<'a>;
 
     fn to_capnp(&self, mut builder: Self::Builder) {
-        debug_assert!(
-            u32::try_from(self.step.get()).is_ok(),
-            "step exceeds u32 range for capnp encoding"
-        );
-        builder.set_step(u32::try_from(self.step.get()).unwrap_or(u32::MAX));
+        builder.set_step(self.step.get() as u64);
         builder.set_aggregation(bar_aggregation_to_capnp(self.aggregation));
         builder.set_price_type(price_type_to_capnp(self.price_type));
     }
@@ -2034,8 +2014,9 @@ impl<'a> FromCapnp<'a> for BarSpecification {
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         use std::num::NonZero;
 
-        let step = reader.get_step();
-        let step = NonZero::new(step as usize).ok_or("BarSpecification step must be non-zero")?;
+        let step = usize::try_from(reader.get_step())
+            .map_err(|_| "BarSpecification step exceeds usize range")?;
+        let step = NonZero::new(step).ok_or("BarSpecification step must be non-zero")?;
 
         let aggregation = bar_aggregation_from_capnp(reader.get_aggregation()?);
         let price_type = price_type_from_capnp(reader.get_price_type()?);

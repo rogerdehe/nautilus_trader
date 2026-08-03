@@ -140,6 +140,8 @@ def main() -> None:
                 use_post_only=True,
                 cancel_orders_on_stop=live_orders,
                 close_positions_on_stop=live_orders,
+                close_positions_qty_precision=2,
+                close_positions_time_in_force=TimeInForce.IOC,
                 reduce_only_on_stop=False,
                 dry_run=args.dry_run,
                 log_data=args.log_data,
@@ -270,7 +272,7 @@ def build_updown_event_slugs(
     period_secs = interval_mins * 60
     now = unix_secs if unix_secs is not None else int(time.time())
     period_start = (now // period_secs) * period_secs
-    slugs = []
+    slugs: list[str] = []
 
     for period in range(periods):
         timestamp = period_start + (start_offset_periods + period) * period_secs

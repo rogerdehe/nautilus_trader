@@ -69,6 +69,7 @@ use nautilus_model::{
     types::Quantity,
 };
 use nautilus_network::http::HttpClient;
+use nautilus_testkit::events::drain_data_events;
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -491,18 +492,6 @@ async fn start_test_server()
     .await;
 
     Ok((addr, state))
-}
-
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
-    }
-    events
 }
 
 fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
@@ -1110,8 +1099,7 @@ async fn test_http_network_error() {
     let base_url = "http://127.0.0.1:1".to_string();
 
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 1, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 1, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 
@@ -1153,8 +1141,7 @@ async fn test_http_500_internal_server_error() {
 
     let base_url = format!("http://{addr}");
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 60, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 

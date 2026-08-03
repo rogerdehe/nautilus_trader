@@ -8,6 +8,9 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
+    "POLYMARKET",
+    "POLYMARKET_CLIENT_ID",
+    "POLYMARKET_VENUE",
     "PolymarketDataClientConfig",
     "PolymarketDataClientFactory",
     "PolymarketDataLoader",
@@ -19,6 +22,10 @@ __all__ = [
     "PolymarketUpDownEventSlugConfig",
     "SignatureType",
 ]
+
+POLYMARKET: str
+POLYMARKET_CLIENT_ID: model.ClientId
+POLYMARKET_VENUE: model.Venue
 
 @typing.final
 class PolymarketDataClientConfig:
@@ -93,7 +100,10 @@ class PolymarketDataClientConfig:
         base_url_rtds: str | None = None,
         transport_backend: network.TransportBackend | None = None,
         drop_quotes_missing_side: bool | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class PolymarketDataClientFactory:
@@ -125,7 +135,7 @@ class PolymarketExecClientConfig:
     @property
     def retry_delay_max_ms(self) -> int: ...
     @property
-    def ack_timeout_secs(self) -> int: ...
+    def heartbeat_enabled(self) -> bool: ...
     @property
     def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
@@ -145,9 +155,12 @@ class PolymarketExecClientConfig:
         max_retries: int | None = None,
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
-        ack_timeout_secs: int | None = None,
+        heartbeat_enabled: bool | None = None,
         transport_backend: network.TransportBackend | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class PolymarketExecutionClientFactory:

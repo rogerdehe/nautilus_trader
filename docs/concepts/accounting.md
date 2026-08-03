@@ -14,11 +14,11 @@ configuration (starting balances, margin-model selection per venue), see
 When you attach a venue to the engine for either live trading or a backtest, you
 pick one of three accounting modes via `account_type`:
 
-| Account type | Typical use case                                 | What the engine locks                                                     |
-| ------------ | ------------------------------------------------ | ------------------------------------------------------------------------- |
-| Cash         | Spot trading (e.g., BTC/USDT, stocks)            | Notional value for every position a pending order would open.             |
-| Margin       | Derivatives or any product that allows leverage  | Initial margin for each order plus maintenance margin for open positions. |
-| Betting      | Sports betting, bookmaking                       | Stake required by the venue; no leverage.                                 |
+| Account type | Typical use case                                | What the engine locks                                                     |
+| ------------ | ----------------------------------------------- | ------------------------------------------------------------------------- |
+| Cash         | Spot trading (e.g., BTC/USDT, stocks)           | Notional value for every position a pending order would open.             |
+| Margin       | Derivatives or any product that allows leverage | Initial margin for each order plus maintenance margin for open positions. |
+| Betting      | Sports betting, bookmaking                      | Stake required by the venue; no leverage.                                 |
 
 ### Cash accounts
 
@@ -85,7 +85,7 @@ Accounting values retain their source currency until an explicit conversion succ
 number from being labeled with the wrong currency or an unavailable value from being treated as zero.
 
 | Value                        | Currency contract                                              |
-|------------------------------|----------------------------------------------------------------|
+| ---------------------------- | -------------------------------------------------------------- |
 | Instrument cost currency     | Base for inverse, settlement for quanto, and quote otherwise.  |
 | Position PnL                 | Instrument cost currency captured when the position opens.     |
 | Calculated locks and margins | Each calculated amount's currency, converted independently.    |
@@ -371,7 +371,9 @@ class RiskAdjustedMarginModel(MarginModel):
         self.risk_multiplier = Decimal(str(config.config.get("risk_multiplier", 1.0)))
         self.use_leverage = config.config.get("use_leverage", False)
 
-    def calculate_margin_init(self, instrument, quantity, price, leverage, use_quote_for_inverse=False):
+    def calculate_margin_init(
+        self, instrument, quantity, price, leverage, use_quote_for_inverse=False
+    ):
         notional = instrument.notional_value(quantity, price, use_quote_for_inverse)
 
         if self.use_leverage:
@@ -382,8 +384,12 @@ class RiskAdjustedMarginModel(MarginModel):
         margin = adjusted * instrument.margin_init * self.risk_multiplier
         return Money(margin, instrument.quote_currency)
 
-    def calculate_margin_maint(self, instrument, side, quantity, price, leverage, use_quote_for_inverse=False):
-        return self.calculate_margin_init(instrument, quantity, price, leverage, use_quote_for_inverse)
+    def calculate_margin_maint(
+        self, instrument, side, quantity, price, leverage, use_quote_for_inverse=False
+    ):
+        return self.calculate_margin_init(
+            instrument, quantity, price, leverage, use_quote_for_inverse
+        )
 ```
 
 For backtest-wide configuration of the margin model via `BacktestVenueConfig`

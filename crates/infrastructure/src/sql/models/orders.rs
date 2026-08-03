@@ -267,7 +267,7 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
             .ok()
             .and_then(|x| x.map(|x| serde_json::from_value::<Vec<String>>(x).unwrap()))
             .map(|x| x.into_iter().map(|x| Ustr::from(x.as_str())).collect());
-        let order_event = OrderInitialized::new(
+        let order_event = OrderInitialized::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -302,7 +302,8 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-        );
+        )
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
         Ok(Self(order_event))
     }
 }
@@ -659,8 +660,8 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
             .try_get::<Option<&str>, _>("liquidity_side")
             .ok()
             .and_then(|x| x.map(|x| LiquiditySide::from_str(x).expect("Invalid `LiquiditySide`")));
-        let avg_px = row.try_get::<Option<f64>, _>("avg_px").ok().flatten();
-        let slippage = row.try_get::<Option<f64>, _>("slippage").ok().flatten();
+        let avg_px = row.try_get::<Option<Decimal>, _>("avg_px").ok().flatten();
+        let slippage = row.try_get::<Option<Decimal>, _>("slippage").ok().flatten();
         let commissions = row
             .try_get::<Option<Vec<String>>, _>("commissions")?
             .map_or_else(Vec::new, |c| {
