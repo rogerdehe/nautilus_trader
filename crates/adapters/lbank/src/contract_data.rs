@@ -148,7 +148,6 @@ impl LbankContractDataClient {
         let data_sender = self.data_sender.clone();
         let cancellation_token = self.cancellation_token.clone();
         let instruments = Arc::clone(&self.instruments);
-        let sub_map = self.ws_client.sub_map();
         let clock = self.clock;
 
         let task = get_runtime().spawn(async move {
@@ -157,17 +156,19 @@ impl LbankContractDataClient {
                 tokio::select! {
                     () = cancellation_token.cancelled() => break,
                     msg_opt = raw_rx.recv() => {
-                        let Some(msg) = msg_opt else { break };
+                        // Each message is tagged with its instrument by the owning per-coin socket
+                        // (one socket == one instrument), so attribution needs no subscription-id map.
+                        let Some((instrument_id, msg)) = msg_opt else { break };
                         let text = match msg {
                             Message::Text(t) => t.to_string(),
                             Message::Binary(b) => match String::from_utf8(b.to_vec()) {
                                 Ok(t) => t,
                                 Err(_) => continue,
                             },
-                            Message::Close(_) => break,
+                            Message::Close(_) => continue,
                             _ => continue,
                         };
-                        forward_contract_text(&text, &instruments, &sub_map, &data_sender, clock);
+                        forward_contract_text(&text, instrument_id, &instruments, &data_sender, clock);
                     }
                 }
             }
@@ -191,8 +192,8 @@ fn precisions(
 
 fn forward_contract_text(
     text: &str,
+    instrument_id: InstrumentId,
     instruments: &AtomicMap<InstrumentId, InstrumentAny>,
-    sub_map: &AtomicMap<u64, InstrumentId>,
     data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
 ) {
@@ -204,18 +205,9 @@ fn forward_contract_text(
         }
     };
 
-    // Attribute the frame to an instrument via the subscription id (`y`).
-    let instrument_id = frame
-        .sub_id()
-        .and_then(|id| sub_map.get_cloned(&id));
-
     let ts_init = clock.get_time_ns();
 
     if frame.is_depth() {
-        let Some(instrument_id) = instrument_id else {
-            log::debug!("LBank contract depth frame with no mapped subscription id");
-            return;
-        };
         let Some((price_precision, size_precision)) = precisions(instruments, &instrument_id) else {
             log::debug!("LBank contract depth for uncached instrument {instrument_id}");
             return;
@@ -231,10 +223,6 @@ fn forward_contract_text(
             Err(e) => log::debug!("LBank contract depth parse failed: {e}"),
         }
     } else if frame.is_trade() {
-        let Some(instrument_id) = instrument_id else {
-            log::debug!("LBank contract trade frame with no mapped subscription id");
-            return;
-        };
         let Some((price_precision, size_precision)) = precisions(instruments, &instrument_id) else {
             log::debug!("LBank contract trade for uncached instrument {instrument_id}");
             return;
