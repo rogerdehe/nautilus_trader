@@ -306,17 +306,40 @@ impl BybitExecutionClient {
             return;
         };
         let lev = leverage.to_string();
-        let result = self
-            .http_client
-            .set_leverage(symbol.product_type(), symbol.raw_symbol(), &lev, &lev)
-            .await;
 
-        match result {
-            Ok(_) => log::info!("Set leverage for {symbol_str} to {leverage}"),
-            Err(e) if Self::is_unchanged_error(&e, "110043") => {
-                log::debug!("Leverage already set for {symbol_str} to {leverage}");
+        // Retry transient failures before giving up (2026-08-04 tsmom risk audit finding: this
+        // connect-time push previously failed SILENTLY on the first error with no retry — a transient
+        // network/rate-limit blip could leave a symbol on the exchange's default leverage undetected
+        // until the next leverage_guard.py sweep). Retrying an idempotent leverage-set call changes no
+        // trading decision, so it's safe to ship without the wider fail-closed design (blocking order
+        // submission on unconfirmed leverage) that's deferred pending a dedicated design pass.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = self.http_client.set_leverage(symbol.product_type(), symbol.raw_symbol(), &lev, &lev).await;
+            match result {
+                Ok(_) => {
+                    log::info!("Set leverage for {symbol_str} to {leverage}");
+                    return;
+                }
+                Err(e) if Self::is_unchanged_error(&e, "110043") => {
+                    log::debug!("Leverage already set for {symbol_str} to {leverage}");
+                    return;
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS {
+                        log::warn!("Failed to set leverage for {symbol_str} (attempt {attempt}/{MAX_ATTEMPTS}), retrying: {e}");
+                        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                    }
+                    last_err = Some(e);
+                }
             }
-            Err(e) => log::error!("Failed to set leverage for {symbol_str}: {e}"),
+        }
+        if let Some(e) = last_err {
+            log::error!(
+                "Failed to set leverage for {symbol_str} after {MAX_ATTEMPTS} attempts: {e} — \
+                 will only be caught by the next leverage_guard.py sweep, verify manually"
+            );
         }
     }
 
