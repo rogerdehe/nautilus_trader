@@ -2504,6 +2504,97 @@ fn test_submit_order_when_less_than_min_notional_for_instrument_then_denies(
     );
 }
 
+/// A reduce-only order below `min_notional` must be ALLOWED.
+///
+/// Venues do not apply their minimum-notional filter to reduce-only orders (Binance USD-M states this
+/// explicitly), precisely so a position whose notional has drifted below the filter can still be closed.
+/// Enforcing it locally makes the pre-trade check stricter than the venue and traps the trader's own
+/// position: every exit path — protective stop, reduce-only maker exit, reduce-only market close — gets
+/// denied locally while the venue would accept it.
+///
+/// Same setup as `test_submit_order_when_less_than_min_notional_for_instrument_then_denies`; the ONLY
+/// difference is `reduce_only(true)`, so a regression here is unambiguous.
+#[rstest]
+fn test_submit_reduce_only_order_below_min_notional_is_allowed(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_xbtusd_with_high_size_precision: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    bitmex_cash_account_state_multi: AccountState,
+    mut simple_cache: Cache,
+) {
+    consume_fixture(execute_order_event_handler);
+    simple_cache
+        .add_instrument(instrument_xbtusd_with_high_size_precision.clone())
+        .unwrap();
+
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            bitmex_cash_account_state_multi,
+        )))
+        .unwrap();
+
+    let quote = QuoteTick::new(
+        instrument_xbtusd_with_high_size_precision.id(),
+        Price::from("0.075000"),
+        Price::from("0.075005"),
+        Quantity::from("50000"),
+        Quantity::from("50000"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+
+    simple_cache.add_quote(quote).unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+
+    // Notional 0.90 < min_notional 1.00 — identical to the denial test above.
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_xbtusd_with_high_size_precision.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("0.9").unwrap())
+        .reduce_only(true)
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_xbtusd_with_high_size_precision.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None, // params
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    let denied: Vec<_> = saved_process_messages
+        .iter()
+        .filter(|e| e.event_type() == OrderEventType::Denied)
+        .collect();
+    assert!(
+        denied.is_empty(),
+        "reduce-only order below min_notional must NOT be denied, got: {:?}",
+        denied.iter().map(|e| e.message()).collect::<Vec<_>>()
+    );
+}
+
 #[rstest]
 fn test_submit_order_when_greater_than_max_notional_for_instrument_then_denies(
     strategy_id_ema_cross: StrategyId,

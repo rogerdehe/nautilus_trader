@@ -1419,8 +1419,25 @@ impl RiskEngine {
                 return false; // Denied
             }
 
-            // Check MIN notional instrument limit
+            // Check MIN notional instrument limit.
+            //
+            // Reduce-only orders are EXEMPT. Venues that publish a minimum-notional filter do not apply
+            // it to reduce-only orders — Binance USD-M states this explicitly ("Reduce only orders are
+            // not affected by the minimum notional value threshold") — precisely so that a position
+            // whose notional has drifted below the filter can still be closed.
+            //
+            // Without this exemption the local pre-trade check is STRICTER than the venue and traps the
+            // trader's own position: once an open position's notional falls under the filter (an adverse
+            // price move on a position opened near the floor is enough), every exit path is denied
+            // locally — the protective stop, the reduce-only maker exit, and a reduce-only market close
+            // alike. The position is then permanently un-closable AND permanently un-protectable through
+            // the engine, even though the venue itself would happily accept the closing order.
+            //
+            // Observed live (2026-08-09, Binance USD-M LTCUSDT-PERP): min_notional $20.00, position
+            // notional $19.03 after a ~5% drop; 5336 denied stop attempts over 2h20m on an earlier
+            // occurrence, with the position carrying zero protective coverage throughout.
             if let Some(min_notional) = instrument.min_notional()
+                && !order.is_reduce_only()
                 && notional.currency == min_notional.currency
                 && notional < min_notional
             {
