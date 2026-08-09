@@ -16,8 +16,51 @@
 //! Data transfer objects for deserializing Bybit HTTP API payloads.
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use ustr::Ustr;
+
+/// Deserialize an integer field that Bybit may send as either a JSON number or a JSON string.
+///
+/// Bybit is not consistent about the JSON type of its small integer fields, and the inconsistency is
+/// not documented — the same field can arrive as `0` on one endpoint and `"0"` on another, or change
+/// between account types. serde is all-or-nothing, so a single unexpected string aborts the whole
+/// response: one `"0"` where an `i32` was expected takes down every order in the payload.
+///
+/// Observed live (2026-08-09): `generate_order_status_reports` against Bybit failed 8,297 times in 24h
+/// with `invalid type: string "0", expected i32`, leaving a live strategy unable to reconcile ANY of
+/// its open orders against the venue — it could only trust WebSocket pushes, so a single missed push
+/// meant a permanent local/venue divergence.
+fn de_i32_lenient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr<'a> {
+        Num(i32),
+        Str(&'a str),
+    }
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(n) => Ok(n),
+        // Bybit also sends "" for "not applicable" on some product types; treat it as the zero default
+        // rather than failing the whole payload over an absent optional value.
+        NumOrStr::Str("") => Ok(0),
+        NumOrStr::Str(s) => s.parse::<i32>().map_err(D::Error::custom),
+    }
+}
+
+/// Same leniency for the `triggerDirection` enum, which is `#[repr(i32)]` and therefore hits exactly
+/// the same "string where a number was expected" failure.
+fn de_trigger_direction_lenient<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BybitTriggerDirection, D::Error> {
+    let raw = de_i32_lenient(deserializer)?;
+    match raw {
+        0 => Ok(BybitTriggerDirection::None),
+        1 => Ok(BybitTriggerDirection::RisesTo),
+        2 => Ok(BybitTriggerDirection::FallsTo),
+        other => Err(D::Error::custom(format!(
+            "unknown Bybit triggerDirection: {other}"
+        ))),
+    }
+}
 
 use crate::common::{
     enums::{
@@ -853,6 +896,7 @@ pub struct BybitAccountInfo {
     #[serde(default)]
     pub time_window: i32,
     #[serde(default)]
+    #[serde(deserialize_with = "de_i32_lenient")]
     pub smp_group: i32,
 }
 
@@ -885,6 +929,7 @@ pub struct BybitOrder {
     pub qty: String,
     pub side: BybitOrderSide,
     pub is_leverage: String,
+    #[serde(deserialize_with = "de_i32_lenient")]
     pub position_idx: i32,
     pub order_status: BybitOrderStatus,
     pub cancel_type: BybitCancelType,
@@ -904,12 +949,14 @@ pub struct BybitOrder {
     pub stop_loss: String,
     pub tp_trigger_by: BybitTriggerType,
     pub sl_trigger_by: BybitTriggerType,
+    #[serde(deserialize_with = "de_trigger_direction_lenient")]
     pub trigger_direction: BybitTriggerDirection,
     pub trigger_by: BybitTriggerType,
     pub last_price_on_created: String,
     pub reduce_only: bool,
     pub close_on_trigger: bool,
     pub smp_type: BybitSmpType,
+    #[serde(deserialize_with = "de_i32_lenient")]
     pub smp_group: i32,
     pub smp_order_id: Ustr,
     pub tpsl_mode: Option<BybitTpSlMode>,
@@ -1939,6 +1986,43 @@ mod tests {
 
     use super::*;
     use crate::common::testing::load_test_json;
+
+    /// Bybit sends these small integer fields as JSON strings on some endpoints/account types.
+    /// serde is all-or-nothing, so one `"0"` used to abort the entire order-status payload — every
+    /// open order in the response, not just the one field. Observed live: 8,297 failures in 24h with
+    /// `invalid type: string "0", expected i32`, leaving a strategy unable to reconcile any order.
+    #[rstest]
+    fn deserialize_order_accepts_stringified_integer_fields() {
+        // Field order and shape follow Bybit's `/v5/order/realtime` response; `positionIdx`,
+        // `triggerDirection` and `smpGroup` are deliberately quoted here.
+        let json = r#"{
+            "orderId":"1783043900000000000","orderLinkId":"TSMOM-1","blockTradeId":"",
+            "symbol":"STORJUSDT","price":"0.2350","qty":"392.5","side":"Sell","isLeverage":"0",
+            "positionIdx":"0","orderStatus":"New","cancelType":"UNKNOWN","rejectReason":"EC_NoError",
+            "avgPrice":"0","leavesQty":"392.5","leavesValue":"92.2375","cumExecQty":"0",
+            "cumExecValue":"0","cumExecFee":"0","timeInForce":"GTC","orderType":"Limit",
+            "stopOrderType":"","orderIv":"","triggerPrice":"0.0000","takeProfit":"0.0000",
+            "stopLoss":"0.0000","tpTriggerBy":"","slTriggerBy":"","triggerDirection":"0",
+            "triggerBy":"","lastPriceOnCreated":"0.2348","reduceOnly":false,"closeOnTrigger":false,
+            "smpType":"None","smpGroup":"0","smpOrderId":"","tpslMode":"","tpLimitPrice":"",
+            "slLimitPrice":"","placeType":"","createdTime":"1786200000000",
+            "updatedTime":"1786200000000"
+        }"#;
+        let order: BybitOrder = serde_json::from_str(json).expect("stringified ints must parse");
+        assert_eq!(order.position_idx, 0);
+        assert_eq!(order.smp_group, 0);
+        assert_eq!(order.trigger_direction, BybitTriggerDirection::None);
+
+        // The native numeric form must keep working.
+        let numeric = json
+            .replace("\"positionIdx\":\"0\"", "\"positionIdx\":0")
+            .replace("\"triggerDirection\":\"0\"", "\"triggerDirection\":1")
+            .replace("\"smpGroup\":\"0\"", "\"smpGroup\":7");
+        let order: BybitOrder = serde_json::from_str(&numeric).expect("numeric form must parse");
+        assert_eq!(order.position_idx, 0);
+        assert_eq!(order.smp_group, 7);
+        assert_eq!(order.trigger_direction, BybitTriggerDirection::RisesTo);
+    }
 
     #[rstest]
     fn deserialize_spot_instrument_uses_enums() {
