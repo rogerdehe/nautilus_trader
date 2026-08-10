@@ -133,6 +133,31 @@ enum TestGuardAcquire {
 
 static SHUTDOWN_ON_ERROR: OnceLock<ShutdownOnError> = OnceLock::new();
 
+/// Service name stamped onto every JSON log line as `service`.
+///
+/// `trader_id` cannot serve this purpose: two market-data recorders run under the same trader id on
+/// different hosts, so it does not identify the service. Without a dedicated field, filtering one
+/// service's logs in a shared log store falls back to matching the source file path — which is a
+/// collection-side tag, not log content, so it is unavailable to the search phase and forces a full
+/// scan in the analysis phase.
+///
+/// Set once at startup, before the logger is initialized. Unset leaves the field out entirely rather
+/// than emitting a placeholder, so a missing call is visible rather than silently wrong.
+static SERVICE_NAME: OnceLock<Ustr> = OnceLock::new();
+
+/// Sets the service name emitted as `service` on every JSON log line.
+///
+/// Call once at startup before initializing the logger. Subsequent calls are ignored.
+pub fn set_service_name(name: &str) {
+    let _ = SERVICE_NAME.set(Ustr::from(name));
+}
+
+/// Returns the configured service name, if [`set_service_name`] was called.
+#[must_use]
+pub fn service_name() -> Option<Ustr> {
+    SERVICE_NAME.get().copied()
+}
+
 /// The first error log captured after shutdown-on-error is armed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownOnErrorTrigger {
@@ -536,6 +561,9 @@ impl Serialize for LogLineWrapper {
         let mut map = serializer.serialize_map(None)?;
 
         map.serialize_entry("timestamp", &timestamp)?;
+        if let Some(service) = service_name() {
+            map.serialize_entry("service", service.as_str())?;
+        }
         map.serialize_entry("trader_id", self.trader_id.as_str())?;
         map.serialize_entry("level", &DisplayAsString(&self.line.level))?;
         map.serialize_entry("color", &DisplayAsString(&self.line.color))?;
@@ -570,7 +598,7 @@ where
 fn is_reserved_json_key(key: &str) -> bool {
     matches!(
         key,
-        "timestamp" | "trader_id" | "level" | "color" | "component" | "message"
+        "timestamp" | "service" | "trader_id" | "level" | "color" | "component" | "message"
     )
 }
 
@@ -607,6 +635,9 @@ where
     let mut json_obj = IndexMap::new();
     let timestamp = unix_nanos_to_iso8601(wrapper.line.timestamp);
     json_obj.insert("timestamp".to_string(), timestamp);
+    if let Some(service) = service_name() {
+        json_obj.insert("service".to_string(), service.to_string());
+    }
     json_obj.insert("trader_id".to_string(), wrapper.trader_id.to_string());
     json_obj.insert("level".to_string(), wrapper.line.level.to_string());
     json_obj.insert("color".to_string(), wrapper.line.color.to_string());
