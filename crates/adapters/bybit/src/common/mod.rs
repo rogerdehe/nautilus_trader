@@ -15,6 +15,7 @@
 
 //! Shared primitives and utilities for the Bybit adapter.
 
+pub mod adl;
 pub mod consts;
 pub mod credential;
 pub mod enums;

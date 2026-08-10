@@ -1060,14 +1060,12 @@ pub fn parse_ws_position_status_report(
     // Bybit ranks open positions 1-5 by ADL priority (5 = next to be deleveraged);
     // 0 means the account has no open position or is flat. Warn when approaching the
     // top tier so operators can react before the venue force-closes.
-    if position.adl_rank_indicator >= 4 {
-        log::warn!(
-            "Elevated ADL risk: {} position size={} adl_rank={}",
-            instrument_id,
-            position.size,
-            position.adl_rank_indicator,
-        );
-    }
+    crate::common::adl::report(
+        &instrument_id.to_string(),
+        position.adl_rank_indicator,
+        &position.size.to_string(),
+        &position.position_value,
+    );
 
     let ts_last = parse_millis_timestamp(&position.updated_time, "position.updatedTime")?;
 
