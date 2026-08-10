@@ -133,6 +133,14 @@ enum TestGuardAcquire {
 
 static SHUTDOWN_ON_ERROR: OnceLock<ShutdownOnError> = OnceLock::new();
 
+/// How long the logging thread waits for a new event before flushing what it already holds.
+///
+/// The file writer is buffered, and nothing else flushes it on a schedule — only an explicit Flush,
+/// Sync or Close event does. For a busy service the buffer fills often enough that this is invisible;
+/// for a quiet one, lines can sit unwritten for as long as the process runs. One second bounds the
+/// delay without adding meaningful wakeups: the flush only happens when the queue is already empty.
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Service name stamped onto every JSON log line as `service`.
 ///
 /// `trader_id` cannot serve this purpose: two market-data recorders run under the same trader id on
@@ -1202,8 +1210,28 @@ impl Logger {
             }
         };
 
-        // Continue to receive and handle log events until channel is hung up
-        while let Ok(event) = rx.recv() {
+        // Continue to receive and handle log events until channel is hung up.
+        //
+        // `recv_timeout` rather than `recv`: the file writer buffers, and without a time-based flush
+        // a low-volume service's lines sit in that buffer indefinitely. Two market-data recorders
+        // looked like they wrote no logs at all in steady state — they were writing, the bytes just
+        // never reached disk until the buffer happened to fill or the process shut down. Anything
+        // reading the file (log collection, an operator tailing it, an alert on the absence of
+        // output) sees a service that has apparently gone silent.
+        loop {
+            let event = match rx.recv_timeout(FLUSH_INTERVAL) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Idle: nothing queued, so anything buffered is complete and can go to disk.
+                    stdout_writer.flush();
+                    stderr_writer.flush();
+                    if let Some(ref mut file_writer) = file_writer_opt {
+                        file_writer.flush();
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match event {
                 LogEvent::Log(_) | LogEvent::Flush | LogEvent::Sync(_) => process_event(
                     event,
