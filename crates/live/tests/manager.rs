@@ -3333,7 +3333,15 @@ async fn test_reconcile_mass_status_sorts_events_chronologically() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_order_generates_rejection_after_max_retries() {
+/// GOLDMINE regression (b0eaa88954, Contract 2 ①, capital-safety): a Submitted order the venue
+/// query could not resolve at max retries is AMBIGUOUS, not rejected. Upstream synthesized
+/// `OrderRejected{INFLIGHT_TIMEOUT}` and cleared tracking; that makes the cached order terminal,
+/// which suppresses later fill inference for the same deterministic orderLinkId → a real venue
+/// fill becomes a local reject and leaves a silent naked leg.
+///
+/// If an upstream merge reintroduces a test asserting a rejection here, that test encodes the
+/// PRE-patch contract — delete it, do not "fix" the source to satisfy it.
+async fn test_inflight_submitted_order_queries_instead_of_rejecting_at_max_retries() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
@@ -3345,7 +3353,7 @@ async fn test_inflight_order_generates_rejection_after_max_retries() {
 
     ctx.add_instrument(test_instrument());
 
-    // Order must be submitted (have account_id) to generate rejection
+    // Order must be submitted (have account_id) to reach the ambiguity branch
     let order = create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
@@ -3355,12 +3363,16 @@ async fn test_inflight_order_generates_rejection_after_max_retries() {
 
     let result = ctx.manager.check_inflight_orders();
 
-    assert_eq!(result.events.len(), 1);
-    assert!(matches!(result.events[0], OrderEventAny::Rejected(_)));
-
-    if let OrderEventAny::Rejected(rejected) = &result.events[0] {
-        assert_eq!(rejected.client_order_id, client_order_id);
-        assert_eq!(rejected.reason.as_str(), "INFLIGHT_TIMEOUT");
+    assert!(
+        result.events.is_empty(),
+        "ambiguous != rejected: no terminal event may be synthesized, was {:?}",
+        result.events
+    );
+    assert_eq!(result.queries.len(), 1);
+    if let TradingCommand::QueryOrder(query) = &result.queries[0] {
+        assert_eq!(query.client_order_id, client_order_id);
+    } else {
+        panic!("Expected QueryOrder, was {:?}", result.queries[0]);
     }
 }
 
@@ -3369,6 +3381,11 @@ async fn test_inflight_order_generates_rejection_after_max_retries() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+/// The monotonic gate decides WHEN the timeout fires; the domain clock stamps the event. Upstream
+/// pinned that split with a Submitted order, but under GOLDMINE b0eaa88954 that path no longer
+/// emits an event (see the ambiguity test above), so the same split is pinned on the PendingUpdate
+/// path — which still synthesizes a terminal Canceled. Coverage of the gate/stamp split is what
+/// matters here, not which order status reaches it.
 async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
@@ -3378,9 +3395,17 @@ async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() 
     let mut ctx = TestContext::with_config(config);
     let instrument_id = test_instrument_id();
     let client_order_id = ClientOrderId::from("O-SPLIT");
+    let venue_order_id = VenueOrderId::from("V-SPLIT");
 
     ctx.add_instrument(test_instrument());
-    let order = create_submitted_order("O-SPLIT", instrument_id, OrderSide::Buy, "1.0", "3000.00");
+    let order = create_pending_update_order(
+        "O-SPLIT",
+        instrument_id,
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        venue_order_id,
+    );
     ctx.add_order(order);
 
     ctx.manager.register_inflight(client_order_id);
@@ -3600,13 +3625,13 @@ async fn test_inflight_increments_retry_count_before_max() {
     assert!(result2.events.is_empty()); // Still not at max
     assert_eq!(result2.queries.len(), 1);
 
-    // Third check - retry count becomes 3, equals max, generates rejection
+    // Third check - retry count becomes 3, equals max. Upstream generated a rejection here;
+    // under GOLDMINE b0eaa88954 a Submitted order stays ambiguous and keeps being queried.
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
     let result3 = ctx.manager.check_inflight_orders();
-    assert_eq!(result3.events.len(), 1);
-    assert!(matches!(result3.events[0], OrderEventAny::Rejected(_)));
-    assert!(result3.queries.is_empty());
+    assert!(result3.events.is_empty());
+    assert_eq!(result3.queries.len(), 1);
 }
 
 #[cfg_attr(
@@ -3745,7 +3770,10 @@ async fn test_inflight_generates_query_before_max_retries() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_no_query_at_max_retries() {
+/// GOLDMINE b0eaa88954 inverts the upstream contract here: at max retries a Submitted order is
+/// queried again rather than terminated, and tracking is NOT cleared — see
+/// `test_inflight_submitted_order_queries_instead_of_rejecting_at_max_retries`.
+async fn test_inflight_keeps_querying_at_max_retries() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 2,
@@ -3768,21 +3796,29 @@ async fn test_inflight_no_query_at_max_retries() {
     assert!(result1.events.is_empty());
     assert_eq!(result1.queries.len(), 1);
 
-    // Second check - at max retries, generates terminal event only
+    // Second check - at max retries: still a query, still no terminal event.
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
     let result2 = ctx.manager.check_inflight_orders();
 
-    assert_eq!(
-        result2.events.len(),
-        1,
-        "Should generate terminal event at max retries"
-    );
     assert!(
-        result2.queries.is_empty(),
-        "Should not generate queries at max retries"
+        result2.events.is_empty(),
+        "Must not synthesize a terminal event for an ambiguous Submitted order, was {:?}",
+        result2.events
     );
-    assert!(matches!(result2.events[0], OrderEventAny::Rejected(_)));
+    assert_eq!(
+        result2.queries.len(),
+        1,
+        "Should keep querying venue truth at max retries"
+    );
+
+    // And tracking survives, so the NEXT tick queries again — this is the half that prevents the
+    // order from being silently dropped once it stops producing a terminal event.
+    ctx.advance_both(dst::time::Duration::from_millis(200))
+        .await;
+    let result3 = ctx.manager.check_inflight_orders();
+    assert!(result3.events.is_empty());
+    assert_eq!(result3.queries.len(), 1, "inflight tracking must survive");
 }
 
 #[cfg_attr(
@@ -3949,6 +3985,9 @@ async fn test_inflight_order_not_in_cache_at_max_retries_no_event() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+/// A terminal event still clears inflight tracking. Upstream pinned this with a Submitted order,
+/// which under GOLDMINE b0eaa88954 no longer terminates; the PendingUpdate path still does, so the
+/// clearing behaviour stays covered.
 async fn test_inflight_terminal_event_clears_tracking() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
@@ -3958,19 +3997,27 @@ async fn test_inflight_terminal_event_clears_tracking() {
     let mut ctx = TestContext::with_config(config);
     let instrument_id = test_instrument_id();
     let client_order_id = ClientOrderId::from("O-TERM");
+    let venue_order_id = VenueOrderId::from("V-TERM");
 
     ctx.add_instrument(test_instrument());
-    let order = create_submitted_order("O-TERM", instrument_id, OrderSide::Buy, "1.0", "3000.00");
+    let order = create_pending_update_order(
+        "O-TERM",
+        instrument_id,
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        venue_order_id,
+    );
     ctx.add_order(order);
 
     ctx.manager.register_inflight(client_order_id);
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
-    // First check generates terminal rejection
+    // First check generates the terminal event
     let result1 = ctx.manager.check_inflight_orders();
     assert_eq!(result1.events.len(), 1);
-    assert!(matches!(result1.events[0], OrderEventAny::Rejected(_)));
+    assert!(matches!(result1.events[0], OrderEventAny::Canceled(_)));
 
     // Second check should return empty (tracking was cleared)
     ctx.advance_both(dst::time::Duration::from_millis(200))
