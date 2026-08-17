@@ -2600,6 +2600,28 @@ impl ExecutionManager {
             .find(|report| report.signed_decimal_qty != Decimal::ZERO)
             .or_else(|| venue_reports.last());
 
+        // No report is not a report of zero.
+        //
+        // `position_qty_aggregates` over an empty slice yields zero, and everything below then reads that
+        // as "the venue says flat". For derivatives that is right: a closed position simply stops being
+        // reported. For SPOT it is not — a spot holding is a wallet balance, not a position, and adapters
+        // deliberately never report one (the Bybit adapter skips Spot outright: "positions API only
+        // supports derivatives"). The instrument was never described at all, and inferring flat from that
+        // silence made the engine synthesise a fill to "correct" the cache to zero — 26 inferred fills
+        // across carry and tsmom in three days, each erasing a spot leg the wallet was still holding,
+        // after which the strategy sees a naked short it does not have and tries to repair it.
+        if venue_reports.is_empty()
+            && matches!(
+                self.cache.borrow().instrument(&instrument_id),
+                Some(InstrumentAny::CurrencyPair(_))
+            )
+        {
+            log::debug!(
+                "Skipping position reconciliation for spot {instrument_id}: the venue reports no spot positions"
+            );
+            return None;
+        }
+
         let tolerance = self.position_reconciliation_tolerance(account_id);
         let venue_has_side_reports = venue_reports.iter().any(PositionStatusReport::is_long)
             && venue_reports.iter().any(PositionStatusReport::is_short);
