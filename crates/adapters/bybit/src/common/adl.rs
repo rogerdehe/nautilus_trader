@@ -28,11 +28,36 @@ use std::sync::{Mutex, OnceLock};
 /// 4 is the point at which the venue is close enough to force-closing that a human might act.
 pub const ELEVATED_RANK: i32 = 4;
 
+/// Quote-currency notional below which an elevated rank is reported at INFO instead of WARN.
+///
+/// Deferring this judgement entirely to the alert layer (as the module doc above originally
+/// proposed) does not work: dedicated rules can threshold on `position_notional`, but a CATCH-ALL
+/// "any WARN" rule cannot, and that is the one that actually pages. Observed live: STORJUSDT at
+/// $16.22 notional oscillating between rank 4 and 5, one WARN per flip, none of them actionable —
+/// the worst case is losing a fraction of $16.
+///
+/// The value matches the `adl-critical` / `adl-notice` split (`position_notional > 500`) so the log
+/// level and the alert rules cannot drift apart. The record is still written either way; only the
+/// claim on an operator's attention changes.
+pub const ACTIONABLE_NOTIONAL: f64 = 500.0;
+
 /// Last rank reported per instrument, so only transitions are logged.
 static LAST_RANK: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
 
 fn last_rank() -> &'static Mutex<HashMap<String, i32>> {
     LAST_RANK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether an elevated rank on this position deserves an operator's attention.
+///
+/// Actionable **unless we can prove the position is small**: an unparseable, empty or absent
+/// notional reports as actionable, because the failure that costs money is staying quiet about a
+/// big position, not being noisy about an unreadable one.
+fn is_actionable(position_value: &str) -> bool {
+    !position_value
+        .trim()
+        .parse::<f64>()
+        .is_ok_and(|v| v < ACTIONABLE_NOTIONAL)
 }
 
 /// Reports an observed ADL rank, logging only when it changes.
@@ -50,16 +75,30 @@ pub fn report(instrument_id: &str, rank: i32, size: &str, position_value: &str) 
     map.insert(instrument_id.to_string(), rank);
 
     if rank >= ELEVATED_RANK {
+        let actionable = is_actionable(position_value);
         // Structured fields, not an interpolated sentence: an alert has to compare the rank and the
         // notional numerically, and values baked into message text can only be string-matched.
-        log::warn!(
-            adl_rank = rank,
-            adl_rank_previous = previous,
-            symbol = instrument_id,
-            position_size = size,
-            position_notional = position_value;
-            "Elevated ADL risk"
-        );
+        // Same message and fields at both levels — the alert rules key off the fields, and only the
+        // level decides whether this interrupts anybody.
+        if actionable {
+            log::warn!(
+                adl_rank = rank,
+                adl_rank_previous = previous,
+                symbol = instrument_id,
+                position_size = size,
+                position_notional = position_value;
+                "Elevated ADL risk"
+            );
+        } else {
+            log::info!(
+                adl_rank = rank,
+                adl_rank_previous = previous,
+                symbol = instrument_id,
+                position_size = size,
+                position_notional = position_value;
+                "Elevated ADL risk"
+            );
+        }
     } else if previous >= ELEVATED_RANK {
         // The recovery edge matters as much as the onset: without it an alert can only ever fire, and
         // whoever is watching has no way to learn the situation resolved itself.
@@ -124,6 +163,34 @@ mod tests {
         report("APEUSDT-LINEAR.BYBIT", 5, "10", "50.0");
         report("APEUSDT-LINEAR.BYBIT", 2, "10", "50.0");
         assert_eq!(seen("APEUSDT-LINEAR.BYBIT"), Some(2));
+    }
+
+    /// The live case that motivated the split: STORJUSDT at $16.22 flipping between rank 4 and 5.
+    /// Each flip is a genuine transition and must still be recorded — just not at WARN, where the
+    /// catch-all "any WARN" alert picks it up and pages about a position worth $16.
+    #[test]
+    fn a_small_position_is_not_actionable() {
+        assert!(!is_actionable("16.2181"));
+        assert!(!is_actionable("499.99"));
+        assert!(is_actionable("500.0"));
+        assert!(is_actionable("12345.6"));
+    }
+
+    /// Actionable unless proven small — an unreadable notional must not buy silence.
+    #[test]
+    fn an_unreadable_notional_is_treated_as_actionable() {
+        assert!(is_actionable(""));
+        assert!(is_actionable("   "));
+        assert!(is_actionable("n/a"));
+        // ...but a well-formed small value with padding still reads as small.
+        assert!(!is_actionable("  16.22  "));
+    }
+
+    /// The threshold must equal the one the alert rules split on, or the log level and the alerting
+    /// drift apart and each looks correct on its own.
+    #[test]
+    fn threshold_matches_the_alert_rules() {
+        assert_eq!(ACTIONABLE_NOTIONAL, 500.0);
     }
 
     /// Instruments must not share state — one going quiet cannot mask another's transition.
