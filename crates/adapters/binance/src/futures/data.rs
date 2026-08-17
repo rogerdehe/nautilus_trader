@@ -116,7 +116,8 @@ struct BufferedDepthUpdate {
     deltas: OrderBookDeltas,
     first_update_id: u64,
     final_update_id: u64,
-    prev_final_update_id: u64,
+    /// `-1` when Binance reports no previous update (see `BinanceFuturesDepthUpdateMsg`).
+    prev_final_update_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1035,7 +1036,12 @@ impl BinanceFuturesDataClient {
 
                     // The first diff is anchored by the snapshot overlap check. After that,
                     // Binance Futures requires each diff's pu to match the previous diff's u.
-                    if !is_first && update.prev_final_update_id != last_final_update_id {
+                    // `pu < 0` means Binance is telling us there IS no previous update — the same
+                    // situation `is_first` covers, not a continuity break.
+                    if !is_first
+                        && update.prev_final_update_id >= 0
+                        && update.prev_final_update_id != last_final_update_id as i64
+                    {
                         if retry_count < MAX_SNAPSHOT_RETRIES {
                             log::warn!(
                                 "OrderBook continuity break for {instrument_id}: \
@@ -1124,7 +1130,9 @@ impl BinanceFuturesDataClient {
                             continue;
                         }
 
-                        if update.prev_final_update_id != last_final_update_id {
+                        if update.prev_final_update_id >= 0
+                            && update.prev_final_update_id != last_final_update_id as i64
+                        {
                             if retry_count < MAX_SNAPSHOT_RETRIES {
                                 log::warn!(
                                     "OrderBook continuity break for {instrument_id}: \

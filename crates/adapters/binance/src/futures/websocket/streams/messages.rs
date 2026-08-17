@@ -233,9 +233,14 @@ pub struct BinanceFuturesDepthUpdateMsg {
     /// Final update ID.
     #[serde(rename = "u")]
     pub final_update_id: u64,
-    /// Previous final update ID.
+    /// Previous final update ID, or `-1` when there is no previous update.
+    ///
+    /// Signed on purpose. Binance sends `pu: -1` — for a newly listed symbol, and after certain stream
+    /// resets — and typing it `u64` failed the whole message, discarding the bids and asks with it. On
+    /// 2026-08-17 that dropped 50 depth updates on the recorder inside one hour, silently, because the
+    /// only trace was a parse warning that named the type error and not the consequence.
     #[serde(rename = "pu")]
-    pub prev_final_update_id: u64,
+    pub prev_final_update_id: i64,
     /// Bids [price, quantity].
     #[serde(rename = "b")]
     pub bids: Vec<[String; 2]>,
