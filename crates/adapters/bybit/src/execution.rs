@@ -328,7 +328,11 @@ impl BybitExecutionClient {
                 }
                 Err(e) => {
                     if attempt < MAX_ATTEMPTS {
-                        log::warn!("Failed to set leverage for {symbol_str} (attempt {attempt}/{MAX_ATTEMPTS}), retrying: {e}");
+                        // INFO, not WARN: an attempt that a retry then succeeds is not an operator
+                        // event — the ERROR on exhaustion below is. Startup sets leverage for every
+                        // symbol at once and reliably trips Bybit's "Too many visits", so at WARN
+                        // this pages on every restart for a condition that heals in 500ms.
+                        log::info!("Failed to set leverage for {symbol_str} (attempt {attempt}/{MAX_ATTEMPTS}), retrying: {e}");
                         tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                     }
                     last_err = Some(e);
