@@ -1580,7 +1580,22 @@ impl ExecutionEngine {
         );
 
         let Some(position) = cache.position(venue_position_id) else {
-            log::error!("Cannot reconcile position: {venue_position_id} not found in cache");
+            // An unknown position id is only a problem if it carries size. Under hedge mode a venue keeps
+            // a LONG and a SHORT slot per instrument and reports BOTH, so a strategy holding only one side
+            // gets a report for an empty slot it never opened — nothing to reconcile, and nothing wrong.
+            //
+            // Bybit pushes that full snapshot at every funding settlement, which produced one ERROR per
+            // open position at 00:00, 08:00 and 16:00 UTC, every day: 118 of them over five days on carry,
+            // all for `<SYM>-LONG` slots against a book that is short-only. A real untracked position —
+            // unknown id WITH size — still reports at ERROR, which is the case worth waking up for.
+            if report.signed_decimal_qty.is_zero() {
+                log::debug!("Ignoring empty venue position slot {venue_position_id} (nothing to reconcile)");
+            } else {
+                log::error!(
+                    "Cannot reconcile position: {venue_position_id} not found in cache (venue qty {})",
+                    report.signed_decimal_qty
+                );
+            }
             return;
         };
 
