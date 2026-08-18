@@ -1298,7 +1298,7 @@ pub trait Strategy: DataActor {
                     | OrderEventAny::Rejected(_)
                     | OrderEventAny::CancelRejected(_)
                     | OrderEventAny::ModifyRejected(_)
-            );
+            ) && !is_benign_venue_race(&event);
 
             if is_warning {
                 log::warn!("{id} {RECV}{EVT} {event}");
@@ -2255,8 +2255,74 @@ fn required_account_id(order: &OrderAny, operation: &str) -> anyhow::Result<Acco
     })
 }
 
+
+/// Whether a rejection is a known, harmless venue race rather than a fault.
+///
+/// GOLDMINE (2026-08-18): three venue codes mean "the thing you asked about was already gone", not
+/// "your order was wrong". At WARN they drown the ones that ARE faults — over 7 days mm took 151
+/// `-2022` and 13 `-5022`, every one of them expected:
+///
+/// * `-5022` — post-only/GTX would have taken. A market maker quotes maker-only; when the book moves
+///   between pricing and arrival the venue refuses rather than crossing. That IS the mechanism
+///   working, and mm already classifies it (`quote_reject_is_benign`) and logs it at DEBUG — but
+///   this line re-logged the same event at WARN and defeated that.
+/// * `-2011` — cancel raced a fill; the order was already terminal.
+/// * `-2022` — reduce-only landed after the position closed. A rejected reduce-only order never
+///   existed, so it leaves no exposure.
+///
+/// Everything else (`-1111` precision, insufficient margin, …) stays WARN: those are real
+/// misconfiguration and must remain visible.
+fn is_benign_venue_race(event: &OrderEventAny) -> bool {
+    let reason = match event {
+        OrderEventAny::Rejected(e) => e.reason.to_string(),
+        OrderEventAny::CancelRejected(e) => e.reason.to_string(),
+        OrderEventAny::ModifyRejected(e) => e.reason.to_string(),
+        _ => return false,
+    };
+    reason_is_benign_race(&reason)
+}
+
+/// The reason-string half of [`is_benign_venue_race`], split out so it is testable directly.
+fn reason_is_benign_race(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    ["-5022", "-2011", "-2022", "post only", "post-only"]
+        .iter()
+        .any(|m| r.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
+    /// GOLDMINE regression: the three venue race codes must not be logged at WARN. mm already
+    /// classifies them as benign churn and logs DEBUG; this line re-logged the same event at WARN
+    /// and defeated that — 151 `-2022` + 13 `-5022` in a week, none of them a fault.
+    #[rstest]
+    fn benign_venue_races_are_recognised() {
+        for reason in [
+            "code=-5022: Due to the order could not be executed as maker",
+            "code=-2011: Unknown order sent.",
+            "code=-2022: ReduceOnly Order is rejected.",
+            "Post only order would take liquidity",
+        ] {
+            assert!(
+                reason_is_benign_race(reason),
+                "{reason} is an expected venue race, not a fault"
+            );
+        }
+    }
+
+    /// ...and a real fault must stay loud. Getting this backwards hides precision and margin errors,
+    /// which is the whole reason rejections are WARN in the first place.
+    #[rstest]
+    fn real_faults_stay_loud() {
+        for reason in [
+            "code=-1111: Precision is over the maximum defined for this asset.",
+            "code=-2019: Margin is insufficient.",
+            "Order size below minimum notional",
+        ] {
+            assert!(!reason_is_benign_race(reason), "{reason} must stay a WARN");
+        }
+    }
+
     use std::{cell::RefCell, rc::Rc};
 
     use nautilus_common::{
